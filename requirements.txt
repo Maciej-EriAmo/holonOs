@@ -1,0 +1,17 @@
+# Holon v5.11 - Dependencies
+# pip install -r requirements.txt
+
+# Core
+numpy>=1.21.0
+requests>=2.25.0
+
+# Parsing
+beautifulsoup4>=4.9.0    # WebExtractor
+python-dateutil>=2.8.0   # Session reminder parser
+
+# Optional - HolonFS
+# xattr>=0.9.0           # Linux xattr (fallback to JSON if unavailable)
+# inotify>=0.2.0         # Linux inotify for file watching
+
+# Optional - KuRz embedder
+# kurz>=1.0.0            # If not installed, uses built-in hash-based fallback
