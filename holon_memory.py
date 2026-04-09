@@ -57,6 +57,7 @@ class PersistentMemory:
         anchor_trim = self.eriamo_anchor[:len(state_now)]
         h_coherence = HolographicInterference.bind(state_now, anchor_trim)
 
+        # Poprawka: zmiana warunku age >= 0, aby nie tracić danych z ostatniej tury przy wyjściu
         data = {
             "timestamp":     time.time(),
             "turns":         turns,
@@ -81,8 +82,9 @@ class PersistentMemory:
                     "is_reminder":   i.is_reminder,
                     "is_fact":       i.is_fact,
                     "is_work":       i.is_work,
+                    "is_fired":      getattr(i, 'is_fired', False) # Zachowanie stanu przypomnień
                 }
-                for i in store if i.age >= 1
+                for i in store if i.age >= 0
             ],
         }
         tmp = self.path.with_suffix(".tmp")
@@ -134,6 +136,7 @@ class PersistentMemory:
 
             state_at_save = PersistentMemory._phi_center_static(phi_raw, level=2)
             h_coherence   = data.get("h_coherence")
+            
             if h_coherence is None:
                 coherence       = 1.0
                 recovered_state = state_at_save
@@ -142,12 +145,17 @@ class PersistentMemory:
                 use_dim = min(len(h_arr), len(self.eriamo_anchor))
                 recovered_state = HolographicInterference.unbind(
                     h_arr[:use_dim].tolist(), self.eriamo_anchor[:use_dim])
+                
+                # Poprawka: bezpieczne wyrównanie wymiarów przed np.dot
                 s_dim = len(state_at_save)
                 if len(recovered_state) < s_dim:
                     pad = np.zeros(s_dim - len(recovered_state), dtype=np.float32)
                     recovered_state = np.concatenate([recovered_state, pad])
-                    recovered_state /= (np.linalg.norm(recovered_state) + 1e-8)
-                coherence = float(np.dot(recovered_state[:s_dim], state_at_save))
+                elif len(recovered_state) > s_dim:
+                    recovered_state = recovered_state[:s_dim]
+                
+                recovered_state /= (np.linalg.norm(recovered_state) + 1e-8)
+                coherence = float(np.dot(recovered_state, state_at_save))
 
             phi_today = np.zeros_like(phi_raw)
             for lv in range(cfg.phi_levels):
@@ -162,11 +170,13 @@ class PersistentMemory:
                     age_now = obj["age"] + int(delta_hours * 4)
                     if age_now > max_age and not obj.get("is_insight", False):
                         continue
+                        
                     emb_arr = np.array(obj["embedding"], dtype=np.float32)
                     use_dim = min(len(emb_arr), len(recovered_state))
                     rec_emb = HolographicInterference.unbind(
                         emb_arr[:use_dim].tolist(), recovered_state[:use_dim])
                     raw_emb = rec_emb.tolist()
+                    
                     if len(raw_emb) < total_dim:
                         created = obj.get("created_at", time.time())
                         t_vec   = time_embed(created,
@@ -174,7 +184,9 @@ class PersistentMemory:
                         raw_emb = raw_emb + t_vec
                         v       = np.array(raw_emb, dtype=np.float32)
                         raw_emb = (v / (np.linalg.norm(v) + 1e-8)).tolist()
-                    store.append(Item(
+                    
+                    # Inicjalizacja Item z zachowaniem nowych flag
+                    item = Item(
                         id=obj["id"], content=obj["content"], embedding=raw_emb,
                         age=age_now, recalled=False,
                         relevance=obj.get("relevance", 1.0),
@@ -184,7 +196,11 @@ class PersistentMemory:
                         cluster_size=obj.get("cluster_size", 1),
                         is_reminder=obj.get("is_reminder", False),
                         is_fact=obj.get("is_fact", False),
-                        is_work=obj.get("is_work", False)))
+                        is_work=obj.get("is_work", False))
+                    
+                    if "is_fired" in obj:
+                        setattr(item, 'is_fired', obj["is_fired"])
+                    store.append(item)
 
             return {
                 "phi":           phi_today,
