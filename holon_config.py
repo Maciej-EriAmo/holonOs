@@ -50,7 +50,7 @@ class Config:
     phase_shifts_learnable: bool = True
     conversation_history_size: int = 12
     topic_repeat_threshold:    int = 3
-    use_prism: bool   = False
+    use_prism: bool   = True
     prism_cfg: object = None
     rumination_generate_insight: bool = True
     insight_prompt_template: str = (
