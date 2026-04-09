@@ -29,19 +29,38 @@ class ReminderWatcher:
             self._check()
 
     def _check(self) -> None:
-        now   = time.time()
-        # Zabezpieczenie: sprawdzamy czy item ma atrybut is_reminder, domyślnie False
-        fired = [i for i in list(self.holomem.store)
-                 if getattr(i, 'is_reminder', False) and i.created_at <= now]
+        now = time.time()
+        # Poprawka logiczna: sprawdzamy cel czasowy (created_at przechowuje timestamp docelowy)
+        # oraz upewniamy się, że nie sprawdzamy już wykonanych przypomnień
+        fired = []
+        
+        # Tworzymy kopię listy do iteracji, aby uniknąć problemów z modyfikacją w locie
+        current_store = list(self.holomem.store)
+        
+        for i in current_store:
+            # Sprawdzenie typu (is_reminder) i czy nadszedł już czas (created_at jako cel)
+            is_rem = getattr(i, 'is_reminder', False)
+            is_fired = getattr(i, 'is_fired', False) # Nowa flaga stanu
+            
+            if is_rem and not is_fired and i.created_at <= now:
+                fired.append(i)
+
         for item in fired:
-            # Ustawiamy is_reminder na False, aby nie odpalać ponownie
-            if hasattr(item, 'is_reminder'):
-                item.is_reminder = False
+            # Oznaczamy jako wykonane zamiast zmieniać typ obiektu
+            # Zapobiega to błędom spójności przy zapisie do JSON
+            if hasattr(item, 'is_fired'):
+                item.is_fired = True
+            else:
+                setattr(item, 'is_fired', True)
+                
+            # Powiadomienie wizualne i dźwiękowe
             msg = (f"\n\a"
                    f"╔══════════════════════════════════════╗\n"
                    f"║  🔔 PRZYPOMNIENIE: {item.content[:35]:<35} ║\n"
                    f"╚══════════════════════════════════════╝")
             print(msg, flush=True)
+            
+            # Wywołanie callbacku, jeśli jest zdefiniowany (np. dla LLM)
             if self.on_fire:
                 try:
                     self.on_fire(item)
