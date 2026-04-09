@@ -8,32 +8,46 @@ import sys
 import importlib.util
 from pathlib import Path
 
+# Lista obecności modułów i ich krytycznych zależności (standardowych i zewnętrznych)
 MODULES = [
     ("holon_config",     []),
     ("holon_item",       ["numpy"]),
     ("holon_embedder",   ["numpy"]),
     ("holon_aii",        ["numpy"]),
     ("holon_holography", ["numpy"]),
-    ("holon_memory",     ["holon_config", "holon_item", "holon_holography", "holon_aii", "holon_embedder"]),
+    ("holon_memory",     ["holon_config", "holon_item", "holon_holography", "holon_aii", "holon_embedder", "numpy"]),
     ("holon_llm",        ["requests"]),
-    ("holon_watcher",    []),
-    ("holon_holomem",    ["holon_config", "holon_item", "holon_holography", "holon_embedder", "holon_aii", "holon_memory"]),
-    ("holon_session",    ["holon_config", "holon_embedder", "holon_holomem", "holon_watcher", "holon_llm"]),
-    ("prompt_scanner",   []),
-    ("web_extractor",    ["requests"]),
+    ("holon_watcher",    ["threading"]),
+    ("holon_holomem",    ["holon_config", "holon_item", "holon_holography", "holon_embedder", "holon_aii", "holon_memory", "numpy"]),
+    ("holon_session",    ["holon_config", "holon_embedder", "holon_holomem", "holon_watcher", "holon_llm", "notes_manager", "requests"]),
+    ("prompt_scanner",   ["re", "json"]),
+    ("web_extractor",    ["requests", "bs4"]), # bs4 z requirements.txt
     ("knowledge_store",  ["numpy"]),
-    ("notes_manager",    []),
-    ("tasks",            []),
+    ("notes_manager",    ["pathlib"]),
+    ("tasks",            ["datetime"]),
+    ("holon_holography", ["numpy"]),
+    ("holon_aii",        ["numpy"])
 ]
 
 def check_module(name: str, deps: list) -> tuple:
-    """Sprawdza czy moduł można zaimportować."""
+    """Sprawdza czy moduł można zaimportować oraz czy jego zależności są dostępne."""
     path = Path(f"{name}.py")
+    
+    # Najpierw sprawdź zależności biblioteczne (zewnętrzne)
+    for dep in deps:
+        if dep not in [m[0] for m in MODULES]: # Jeśli to nie jest nasz moduł wewnętrzny
+            if importlib.util.find_spec(dep) is None:
+                return False, f"Brak biblioteki: {dep}"
+
+    # Sprawdź obecność pliku fizycznego
     if not path.exists():
         return False, f"Brak pliku {name}.py"
     
     try:
+        # Próba załadowania modułu
         spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None:
+            return False, f"Nie można stworzyć specyfikacji dla {name}"
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
@@ -46,7 +60,7 @@ def check_module(name: str, deps: list) -> tuple:
 
 def main():
     print("=" * 60)
-    print("  Holon v5.11 — Weryfikacja importów")
+    print("  Holon v5.11 — Weryfikacja spójności systemu")
     print("=" * 60)
     print()
     
@@ -64,10 +78,11 @@ def main():
     print(f"Wynik: {passed}/{total} modułów poprawnych")
     
     if passed < total:
-        print("\n⚠️  Niektóre moduły mają problemy z importem.")
-        print("   Sprawdź brakujące zależności lub popraw ścieżki.")
+        print("\n⚠️  System niekompletny lub błędy w zależnościach.")
+        print("   Upewnij się, że wszystkie pliki .py są w katalogu")
+        print("   i wykonaj: pip install -r requirements.txt")
     else:
-        print("\n✅ Wszystkie moduły gotowe do użycia!")
+        print("\n✅ Wszystkie moduły obecne i gotowe do pracy!")
     
     print("=" * 60)
     return 0 if passed == total else 1
