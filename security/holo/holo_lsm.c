@@ -79,7 +79,7 @@ enum {
 struct hss_upcall_msg {
     u64 timestamp_ns;
     u32 pid;
-    unsigned long inode_nr;   /* pełny 64‑bitowy numer i‑węzła */
+    u64 inode_nr;   /* jawnie 64-bitowy — niezależny od architektury */
     u32 op_mask;
     u8  nonce[16];
 } __packed;
@@ -285,7 +285,6 @@ static int hss_get_hmac_key(void)
 static int hss_connect_socket(void)
 {
     struct sockaddr_un addr;
-    struct timeval tv;
     int ret;
 
     ret = sock_create_kern(&init_net, AF_UNIX, SOCK_STREAM, 0, &hss_sock);
@@ -303,10 +302,12 @@ static int hss_connect_socket(void)
         return ret;
     }
 
-    /* Ustaw timeout odbioru */
-    tv.tv_sec  = hss_upcall_timeout_ms / 1000;
-    tv.tv_usec = (hss_upcall_timeout_ms % 1000) * 1000;
-    kernel_setsockopt(hss_sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
+    /*
+     * Ustaw timeout odbioru bezpośrednio na sk — kernel_setsockopt()
+     * zostało usunięte w Linux 5.9. Wartość 0 oznacza "bez limitu",
+     * więc wymuszamy minimum 1 jiffie.
+     */
+    hss_sock->sk->sk_rcvtimeo = msecs_to_jiffies(hss_upcall_timeout_ms) ?: 1;
 
     return 0;
 }
@@ -545,6 +546,8 @@ static int __init holo_lsm_init(void)
     }
 
     ret = crypto_shash_setkey(hss_hmac_tfm, hss_hmac_key, sizeof(hss_hmac_key));
+    /* Wymaż klucz z BSS niezależnie od wyniku setkey */
+    memzero_explicit(hss_hmac_key, sizeof(hss_hmac_key));
     if (ret) {
         crypto_free_shash(hss_hmac_tfm);
         return ret;
