@@ -2,7 +2,12 @@
  * security/holo/holo_lsm.c
  *
  * HolonOS HSS LSM — lekki filtr upcall.
- * Wersja uzupełniona i oczyszczona z błędów (v2).
+ * Wersja finalna (v3) — poprawiona zgodność z API LSM.
+ *
+ * UWAGA: Aby moduł działał poprawnie, musi zostać **wbudowany w jądro**
+ * (np. przez dodanie katalogu security/holo/ do źródeł jądra i włączenie
+ * CONFIG_SECURITY_HOLO). Nie można go załadować dynamicznie przez insmod
+ * ze względu na __init funkcji rejestracji hooków LSM.
  *
  * Autor: Maciej Mazur — Independent AI Researcher, Warsaw, Poland
  * GitHub: Maciej-EriAmo/HolonOS
@@ -60,7 +65,7 @@ module_param(hss_rate_limit_per_sec, uint, 0644);
 #define HSS_FLAG_INVALIDATE_CACHE 0x01
 #define HSS_XATTR_NAME "security.hss.lock"
 
-/* Netlink protocol family (custom, nie koliduje z istniejącymi) */
+/* Netlink protocol family (custom) */
 #define NETLINK_HSS 30
 
 /* Komendy Netlink */
@@ -74,14 +79,14 @@ enum {
 struct hss_upcall_msg {
     u64 timestamp_ns;
     u32 pid;
-    unsigned long inode_nr;   /* teraz pełny 64-bit */
+    unsigned long inode_nr;   /* pełny 64‑bitowy numer i‑węzła */
     u32 op_mask;
     u8  nonce[16];
 } __packed;
 
 struct hss_upcall_resp {
     u8  nonce_echo[16];
-    u32 decision;
+    u32 decision;            /* 0 = ZEZWÓL, wartość niezerowa = ODMÓW */
     u32 flags;
 } __packed;
 
@@ -105,7 +110,7 @@ static int hss_cache_lookup(u32 pid, unsigned long inode_nr, u32 op_mask)
 {
     struct hss_cache_entry *entry;
     unsigned long now = jiffies;
-    u64 key = ((u64)pid << 32) | (u32)inode_nr;  // hash używa tylko dolnych 32 bitów i-nr – OK
+    u64 key = ((u64)pid << 32) | (u32)inode_nr;  // hash tylko na dolnych 32 bitach i‑nr
     int ret = -ENOENT;
 
     rcu_read_lock();
@@ -116,7 +121,7 @@ static int hss_cache_lookup(u32 pid, unsigned long inode_nr, u32 op_mask)
                 ret = 0;
                 break;  /* znaleziono ważny wpis */
             }
-            /* wpis wygasł – kontynuujemy szukanie (może być inny ważny) */
+            /* wpis wygasł — kontynuujemy szukanie (może być inny ważny) */
         }
     }
     rcu_read_unlock();
@@ -128,7 +133,7 @@ static void hss_cache_store(u32 pid, unsigned long inode_nr, u32 op_mask, u32 de
     struct hss_cache_entry *entry, *tmp;
     u64 key = ((u64)pid << 32) | (u32)inode_nr;
 
-    if (decision != 0)
+    if (decision != 0)   /* przechowuj tylko ZEZWOLENIA */
         return;
 
     /* Sprawdź, czy wpis już istnieje (deduplikacja) */
@@ -448,12 +453,18 @@ static int holo_inode_permission(struct inode *inode, int mask)
     if (ret < 0)
         return -EACCES;
 
+    /* 4. Unieważnij cache jeśli demon tego zażądał */
     if (resp.flags & HSS_FLAG_INVALIDATE_CACHE)
         hss_cache_invalidate(pid, inode->i_ino);
 
+    /* 5. Zapisz zezwolenie w cache (tylko jeśli decyzja == 0) */
     hss_cache_store(pid, inode->i_ino, op, resp.decision);
 
-    return (int)resp.decision;
+    /* 6. Zwróć decyzję zgodnie z konwencją LSM: 0 = zezwól, -EACCES = odmów */
+    if (resp.decision == 0)
+        return 0;
+    else
+        return -EACCES;
 }
 
 /* -----------------------------------------------------------------------
@@ -512,6 +523,12 @@ static int __init holo_lsm_init(void)
 {
     int ret;
 
+    /*
+     * UWAGA: Aby moduł działał poprawnie, musi zostać **wbudowany w jądro**.
+     * Nie można go załadować przez insmod ze względu na __init funkcji
+     * rejestracji hooków LSM (security_add_hooks jest __init).
+     */
+
     /* 1. Pobierz klucz HMAC z keyringu */
     ret = hss_get_hmac_key();
     if (ret) {
@@ -554,7 +571,7 @@ static int __init holo_lsm_init(void)
     /* 5. Zarejestruj hooki LSM */
     security_add_hooks(holo_hooks, ARRAY_SIZE(holo_hooks), "holo");
 
-    pr_info("HolonOS HSS LSM v2 zainicjowany (upcall filter, brak plaintextu w jądrze)\n");
+    pr_info("HolonOS HSS LSM v3 zainicjowany (upcall filter, brak plaintextu w jądrze)\n");
     return 0;
 }
 
