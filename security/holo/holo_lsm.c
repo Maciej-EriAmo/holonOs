@@ -4,7 +4,8 @@
  * HolonOS HSS LSM v3.3 — lekki, bezpieczny filtr upcall
  * Poprawki: non-blocking friendly hook, mutex_trylock + locked upcall,
  *           reconnect z usleep, partial I/O check, decision validation,
- *           race fix na hss_sock, inode_nr = u64
+ *           poprawione cache + rate limiter + cleanup timer, MSG_NOSIGNAL,
+ *           bezpieczne RCU, lepszy hash, pełna implementacja.
  *
  * Autor: Maciej Mazur
  * Licencja: GPL-2.0
@@ -35,7 +36,7 @@
 #include <linux/skbuff.h>
 #include <net/net_namespace.h>
 #include <linux/timer.h>
-#include <linux/delay.h>      /* usleep_range */
+#include <linux/delay.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Maciej Mazur");
@@ -121,7 +122,12 @@ static struct timer_list hss_cleanup_timer;
 /* Netlink */
 static struct sock *hss_nl_sock = NULL;
 
-/* === Deklaracje funkcji pomocniczych ======================================= */
+/* === Deklaracje =========================================================== */
+static int hss_get_hmac_key(void);
+static int hss_connect_socket(void);
+static int hss_reconnect(void);
+static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp *resp);
+static bool hss_inode_has_xattr(struct inode *inode, struct dentry *dentry);
 static int hss_cache_lookup(u32 pid, u64 inode_nr, u32 op_mask);
 static void hss_cache_store(u32 pid, u64 inode_nr, u32 op_mask, u32 decision);
 static void hss_cache_invalidate(u32 pid, u64 inode_nr);
@@ -131,13 +137,8 @@ static void hss_rate_cleanup_old(void);
 static void hss_cleanup_timer_callback(struct timer_list *unused);
 static int hss_netlink_init(void);
 static void hss_netlink_exit(void);
-static int hss_get_hmac_key(void);
-static int hss_connect_socket(void);
-static int hss_reconnect(void);
-static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp *resp);
-static bool hss_inode_has_xattr(struct inode *inode, struct dentry *dentry);
 
-/* === Implementacja ========================================================= */
+/* === Implementacja ======================================================== */
 
 static int hss_get_hmac_key(void)
 {
@@ -288,7 +289,7 @@ static bool hss_inode_has_xattr(struct inode *inode, struct dentry *dentry)
     return __vfs_getxattr(dentry, inode, HSS_XATTR_NAME, &val, sizeof(val)) >= 0;
 }
 
-/* === Cache (RCU) =========================================================== */
+/* === Cache ================================================================ */
 static int hss_cache_lookup(u32 pid, u64 inode_nr, u32 op_mask)
 {
     struct hss_cache_entry *entry;
@@ -392,7 +393,7 @@ static void hss_cache_flush_old_entries(void)
         kfree_rcu(entry, rcu);
 }
 
-/* === Rate limiter ========================================================== */
+/* === Rate limiter ========================================================= */
 static bool hss_rate_check(u32 pid)
 {
     struct hss_rate_entry *entry;
@@ -420,7 +421,7 @@ static bool hss_rate_check(u32 pid)
     entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
     if (!entry) {
         spin_unlock_irqrestore(&hss_rate_lock, flags);
-        return true;
+        return true; /* przy braku pamięci – przepuść */
     }
     entry->pid = pid;
     entry->window_start = now;
@@ -452,7 +453,7 @@ static void hss_rate_cleanup_old(void)
         kfree_rcu(entry, rcu);
 }
 
-/* === Timer ================================================================= */
+/* === Timer ================================================================ */
 static void hss_cleanup_timer_callback(struct timer_list *unused)
 {
     hss_cache_flush_old_entries();
@@ -460,7 +461,7 @@ static void hss_cleanup_timer_callback(struct timer_list *unused)
     mod_timer(&hss_cleanup_timer, jiffies + HZ);
 }
 
-/* === Netlink =============================================================== */
+/* === Netlink ============================================================== */
 struct hss_nl_invalidate_msg {
     u32 pid;
     u64 inode_nr;
@@ -498,7 +499,7 @@ static void hss_netlink_exit(void)
         netlink_kernel_release(hss_nl_sock);
 }
 
-/* === Główny hook LSM ======================================================= */
+/* === Główny hook LSM ====================================================== */
 static int holo_inode_permission(struct inode *inode, int mask)
 {
     struct hss_upcall_msg  msg  = {0};
@@ -528,7 +529,7 @@ static int holo_inode_permission(struct inode *inode, int mask)
         return 0;
 
     if (!hss_rate_check(pid))
-        return -EAGAIN;  /* rate limit exceeded – temporary failure */
+        return -EAGAIN;  /* przekroczenie limitu – tymczasowa blokada */
 
     msg.timestamp_ns = ktime_get_mono_fast_ns();
     msg.pid          = pid;
@@ -537,7 +538,7 @@ static int holo_inode_permission(struct inode *inode, int mask)
     get_random_bytes(msg.nonce, sizeof(msg.nonce));
 
     if (!mutex_trylock(&hss_sock_mutex))
-        return -EBUSY;   /* poprawione z -EAGAIN */
+        return -EBUSY;   /* zamiast -EAGAIN – zasób zajęty */
 
     ret = hss_upcall_locked(&msg, &resp);
 
@@ -560,12 +561,12 @@ static int holo_inode_permission(struct inode *inode, int mask)
     return (resp.decision == 0) ? 0 : -EACCES;
 }
 
-/* === Rejestracja hooków ==================================================== */
+/* === Rejestracja hooków =================================================== */
 static struct security_hook_list holo_hooks[] __lsm_ro_after_init = {
     LSM_HOOK_INIT(inode_permission, holo_inode_permission),
 };
 
-/* === Inicjalizacja i wyjście =============================================== */
+/* === Init / Exit ========================================================== */
 static int __init holo_lsm_init(void)
 {
     int ret;
