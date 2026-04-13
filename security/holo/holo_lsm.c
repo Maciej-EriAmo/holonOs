@@ -110,7 +110,7 @@ static int hss_cache_lookup(u32 pid, unsigned long inode_nr, u32 op_mask)
 {
     struct hss_cache_entry *entry;
     unsigned long now = jiffies;
-    u64 key = ((u64)pid << 32) | (u32)inode_nr;  // hash tylko na dolnych 32 bitach i‑nr
+    u64 key = ((u64)pid << 32) ^ (u64)inode_nr;
     int ret = -ENOENT;
 
     rcu_read_lock();
@@ -131,7 +131,7 @@ static int hss_cache_lookup(u32 pid, unsigned long inode_nr, u32 op_mask)
 static void hss_cache_store(u32 pid, unsigned long inode_nr, u32 op_mask, u32 decision)
 {
     struct hss_cache_entry *entry, *tmp;
-    u64 key = ((u64)pid << 32) | (u32)inode_nr;
+    u64 key = ((u64)pid << 32) ^ (u64)inode_nr;
 
     if (decision != 0)   /* przechowuj tylko ZEZWOLENIA */
         return;
@@ -475,15 +475,17 @@ static struct sock *hss_nl_sock = NULL;
 static void hss_netlink_rcv(struct sk_buff *skb)
 {
     struct nlmsghdr *nlh = nlmsg_hdr(skb);
-    u32 pid, inode_nr;
+    u32 *data = NLMSG_DATA(nlh);
+    u32 pid;
+    u64 inode_nr;
 
-    if (nlh->nlmsg_len < NLMSG_HDRLEN + 2 * sizeof(u32))
+    /* Format: [cmd u32][pid u32][inode_nr u64] */
+    if (nlh->nlmsg_len < NLMSG_HDRLEN + 2 * sizeof(u32) + sizeof(u64))
         return;
 
-    /* Prosty format: [cmd=1][pid][inode_nr] */
-    if (*(u32 *)NLMSG_DATA(nlh) == HSS_NL_CMD_INVALIDATE) {
-        pid = *((u32 *)NLMSG_DATA(nlh) + 1);
-        inode_nr = *((u32 *)NLMSG_DATA(nlh) + 2);
+    if (data[0] == HSS_NL_CMD_INVALIDATE) {
+        pid = data[1];
+        memcpy(&inode_nr, &data[2], sizeof(u64));
         hss_cache_invalidate(pid, (unsigned long)inode_nr);
     }
 }
