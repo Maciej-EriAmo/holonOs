@@ -49,26 +49,27 @@ MODULE_DESCRIPTION("HolonOS HSS LSM — upcall filter, no plaintext in kernel");
 /* -----------------------------------------------------------------------
  * Parametry konfigurowalne (sysctl w produkcji)
  * ----------------------------------------------------------------------- */
-static unsigned int hss_cache_ttl_ms      = 100;
-static unsigned int hss_upcall_timeout_ms = 5;
+static unsigned int hss_cache_ttl_ms       = 100;
+static unsigned int hss_upcall_timeout_ms  = 5;
 static unsigned int hss_rate_limit_per_sec = 100;
 
-module_param(hss_cache_ttl_ms, uint, 0644);
-module_param(hss_upcall_timeout_ms, uint, 0644);
+module_param(hss_cache_ttl_ms,       uint, 0644);
+module_param(hss_upcall_timeout_ms,  uint, 0644);
 module_param(hss_rate_limit_per_sec, uint, 0644);
 
 /* -----------------------------------------------------------------------
  * Stałe protokołu
  * ----------------------------------------------------------------------- */
-#define HSS_OP_READ    0x01
-#define HSS_OP_WRITE   0x02
+#define HSS_OP_READ               0x01
+#define HSS_OP_WRITE              0x02
 #define HSS_FLAG_INVALIDATE_CACHE 0x01
-#define HSS_XATTR_NAME "security.hss.lock"
+#define HSS_XATTR_NAME            "security.hss.lock"
+#define HSS_DAEMON_SOCK           "/run/hss-daemon.sock"
+#define HSS_KEYRING_NAME          "hss_upcall_key"
 
 /* Netlink protocol family (custom) */
 #define NETLINK_HSS 30
 
-/* Komendy Netlink */
 enum {
     HSS_NL_CMD_INVALIDATE = 1,
 };
@@ -76,17 +77,20 @@ enum {
 /* -----------------------------------------------------------------------
  * Struktury protokołu upcall
  * ----------------------------------------------------------------------- */
+
+/* Wiadomość jądro → demon */
 struct hss_upcall_msg {
     u64 timestamp_ns;
     u32 pid;
-    u64 inode_nr;   /* jawnie 64-bitowy — niezależny od architektury */
+    u64 inode_nr;   /* jawnie u64 — niezależny od architektury (32/64-bit) */
     u32 op_mask;
     u8  nonce[16];
 } __packed;
 
+/* Odpowiedź demon → jądro */
 struct hss_upcall_resp {
     u8  nonce_echo[16];
-    u32 decision;            /* 0 = ZEZWÓL, wartość niezerowa = ODMÓW */
+    u32 decision;   /* 0 = ZEZWÓL, wartość niezerowa = ODMÓW */
     u32 flags;
 } __packed;
 
@@ -94,12 +98,12 @@ struct hss_upcall_resp {
  * Pamięć podręczna decyzji (per-PID + inode, tylko ZEZWOLENIA)
  * ----------------------------------------------------------------------- */
 struct hss_cache_entry {
-    u32 pid;
+    u32           pid;
     unsigned long inode_nr;
-    u32 op_mask;
+    u32           op_mask;
     unsigned long expiry_jiffies;
     struct hlist_node node;
-    struct rcu_head rcu;
+    struct rcu_head   rcu;
 };
 
 #define HSS_CACHE_BITS 8
@@ -119,29 +123,27 @@ static int hss_cache_lookup(u32 pid, unsigned long inode_nr, u32 op_mask)
             (entry->op_mask & op_mask) == op_mask) {
             if (time_before(now, entry->expiry_jiffies)) {
                 ret = 0;
-                break;  /* znaleziono ważny wpis */
+                break;
             }
-            /* wpis wygasł — kontynuujemy szukanie (może być inny ważny) */
         }
     }
     rcu_read_unlock();
     return ret;
 }
 
-static void hss_cache_store(u32 pid, unsigned long inode_nr, u32 op_mask, u32 decision)
+static void hss_cache_store(u32 pid, unsigned long inode_nr,
+                            u32 op_mask, u32 decision)
 {
     struct hss_cache_entry *entry, *tmp;
     u64 key = ((u64)pid << 32) ^ (u64)inode_nr;
 
-    if (decision != 0)   /* przechowuj tylko ZEZWOLENIA */
+    if (decision != 0)
         return;
 
-    /* Sprawdź, czy wpis już istnieje (deduplikacja) */
     spin_lock(&hss_cache_lock);
     hash_for_each_possible(hss_cache_table, tmp, node, key) {
         if (tmp->pid == pid && tmp->inode_nr == inode_nr &&
             tmp->op_mask == op_mask) {
-            /* Aktualizuj czas wygaśnięcia */
             tmp->expiry_jiffies = jiffies + msecs_to_jiffies(hss_cache_ttl_ms);
             spin_unlock(&hss_cache_lock);
             return;
@@ -153,17 +155,16 @@ static void hss_cache_store(u32 pid, unsigned long inode_nr, u32 op_mask, u32 de
         spin_unlock(&hss_cache_lock);
         return;
     }
-
-    entry->pid           = pid;
-    entry->inode_nr      = inode_nr;
-    entry->op_mask       = op_mask;
+    entry->pid            = pid;
+    entry->inode_nr       = inode_nr;
+    entry->op_mask        = op_mask;
     entry->expiry_jiffies = jiffies + msecs_to_jiffies(hss_cache_ttl_ms);
 
     hash_add_rcu(hss_cache_table, &entry->node, key);
     spin_unlock(&hss_cache_lock);
 }
 
-/* Unieważnienie wpisów — wywołane przez demona przez Netlink */
+/* Unieważnienie wpisów — TOCTOU fix, wywołane przez Netlink */
 static void hss_cache_invalidate(u32 pid, unsigned long inode_nr)
 {
     struct hss_cache_entry *entry;
@@ -172,8 +173,8 @@ static void hss_cache_invalidate(u32 pid, unsigned long inode_nr)
 
     spin_lock(&hss_cache_lock);
     hash_for_each_safe(hss_cache_table, bkt, tmp, entry, node) {
-        if ((pid       && entry->pid      == pid)      ||
-            (inode_nr  && entry->inode_nr == inode_nr)) {
+        if ((pid      && entry->pid      == pid)     ||
+            (inode_nr && entry->inode_nr == inode_nr)) {
             hash_del_rcu(&entry->node);
             kfree_rcu(entry, rcu);
         }
@@ -182,11 +183,11 @@ static void hss_cache_invalidate(u32 pid, unsigned long inode_nr)
 }
 
 /* -----------------------------------------------------------------------
- * Ogranicznik szybkości per-PID (rate limiting) z okresowym czyszczeniem
+ * Ogranicznik szybkości per-PID z okresowym czyszczeniem
  * ----------------------------------------------------------------------- */
 struct hss_rate_entry {
-    u32 pid;
-    atomic_t count;
+    u32           pid;
+    atomic_t      count;
     unsigned long window_start;
     struct hlist_node node;
 };
@@ -204,15 +205,12 @@ static void hss_rate_cleanup(struct timer_list *unused)
 
     spin_lock(&hss_rate_lock);
     hash_for_each_safe(hss_rate_table, bkt, tmp, entry, node) {
-        /* Usuwaj wpisy starsze niż 60 sekund od ostatniego okna */
         if (time_after(now, entry->window_start + 60 * HZ)) {
             hash_del(&entry->node);
             kfree(entry);
         }
     }
     spin_unlock(&hss_rate_lock);
-
-    /* Zaplanuj kolejne czyszczenie za 60 sekund */
     mod_timer(&hss_rate_cleanup_timer, jiffies + 60 * HZ);
 }
 
@@ -238,7 +236,6 @@ static bool hss_rate_check(u32 pid)
         return allowed;
     }
 
-    /* Nowy PID */
     rl = kmalloc(sizeof(*rl), GFP_ATOMIC);
     if (rl) {
         rl->pid          = pid;
@@ -254,71 +251,92 @@ static bool hss_rate_check(u32 pid)
 /* -----------------------------------------------------------------------
  * Komunikacja z hss-daemon (gniazdo Unix, HMAC-SHA256)
  * ----------------------------------------------------------------------- */
-static struct socket  *hss_sock     = NULL;
+static struct socket    *hss_sock    = NULL;
 static struct crypto_shash *hss_hmac_tfm = NULL;
-static u8 hss_hmac_key[32]; /* wypełniany z keyringu */
+static u8 hss_hmac_key[32];
 static DEFINE_MUTEX(hss_sock_mutex);
 
-/* Pobranie klucza HMAC z keyringu jądra (użytkownik musi go wcześniej dodać) */
+/*
+ * Pobranie klucza HMAC z keyringu jądra.
+ * Wymagane przed startem modułu:
+ *   keyctl add user hss_upcall_key <32-byte-key> @s
+ */
 static int hss_get_hmac_key(void)
 {
     struct key *key;
     const struct user_key_payload *payload;
     int ret = -ENOKEY;
 
-    key = request_key(&key_type_user, "hss_upcall_key", NULL);
-    if (IS_ERR(key))
+    key = request_key(&key_type_user, HSS_KEYRING_NAME, NULL);
+    if (IS_ERR(key)) {
+        pr_err("holo_lsm: klucz '%s' nie istnieje w keyringu\n",
+               HSS_KEYRING_NAME);
         return PTR_ERR(key);
+    }
 
     down_read(&key->sem);
     payload = user_key_payload_locked(key);
-    if (payload && payload->datalen == 32) {
-        memcpy(hss_hmac_key, payload->data, 32);
-        ret = 0;
+    if (!payload || payload->datalen != sizeof(hss_hmac_key)) {
+        pr_err("holo_lsm: nieprawidłowy rozmiar klucza HMAC "
+               "(oczekiwano %zu, otrzymano %u)\n",
+               sizeof(hss_hmac_key),
+               payload ? payload->datalen : 0);
+        ret = -EINVAL;
+        goto out_put;
     }
+
+    memcpy(hss_hmac_key, payload->data, sizeof(hss_hmac_key));
+    ret = 0;
+
+out_put:
     up_read(&key->sem);
     key_put(key);
     return ret;
 }
 
-/* Inicjalizacja gniazda Unix i połączenie z demonem */
+/*
+ * Nawiązanie połączenia z hss-daemon przez gniazdo Unix.
+ * Demon musi być uruchomiony przed inicjalizacją LSM.
+ */
 static int hss_connect_socket(void)
 {
-    struct sockaddr_un addr;
+    struct sockaddr_un addr = {
+        .sun_family = AF_UNIX,
+    };
     int ret;
 
+    strncpy(addr.sun_path, HSS_DAEMON_SOCK, sizeof(addr.sun_path) - 1);
+
     ret = sock_create_kern(&init_net, AF_UNIX, SOCK_STREAM, 0, &hss_sock);
-    if (ret < 0)
-        return ret;
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, "/run/hss-daemon.sock", sizeof(addr.sun_path) - 1);
-
-    ret = kernel_connect(hss_sock, (struct sockaddr *)&addr, sizeof(addr), 0);
-    if (ret < 0) {
-        sock_release(hss_sock);
-        hss_sock = NULL;
+    if (ret) {
+        pr_err("holo_lsm: nie można utworzyć gniazda Unix (ret=%d)\n", ret);
         return ret;
     }
 
-    /*
-     * Ustaw timeout odbioru bezpośrednio na sk — kernel_setsockopt()
-     * zostało usunięte w Linux 5.9. Wartość 0 oznacza "bez limitu",
-     * więc wymuszamy minimum 1 jiffie.
-     */
-    hss_sock->sk->sk_rcvtimeo = msecs_to_jiffies(hss_upcall_timeout_ms) ?: 1;
-
-    return 0;
+    ret = kernel_connect(hss_sock, (struct sockaddr *)&addr,
+                         sizeof(addr), 0);
+    if (ret) {
+        pr_err("holo_lsm: nie można połączyć z %s (ret=%d)\n",
+               HSS_DAEMON_SOCK, ret);
+        sock_release(hss_sock);
+        hss_sock = NULL;
+    }
+    return ret;
 }
 
+/*
+ * Wysłanie upcall i odebranie odpowiedzi.
+ * Dwukierunkowe uwierzytelnienie HMAC-SHA256.
+ * Dwa oddzielne bufory HMAC — hmac_recv_stored i hmac_recv_computed.
+ * Weryfikacja nonce — ochrona przed replay attack.
+ */
 static int hss_upcall(struct hss_upcall_msg *msg, struct hss_upcall_resp *resp)
 {
     struct msghdr mh = {0};
     struct kvec   iov[2];
     u8 hmac_sent[32];
-    u8 hmac_recv_stored[32];
-    u8 hmac_recv_computed[32];
+    u8 hmac_recv_stored[32];   /* HMAC odebrany od demona */
+    u8 hmac_recv_computed[32]; /* HMAC obliczony lokalnie do weryfikacji */
     struct hss_upcall_resp tmp;
     int ret;
 
@@ -334,6 +352,7 @@ static int hss_upcall(struct hss_upcall_msg *msg, struct hss_upcall_resp *resp)
             return ret;
     }
 
+    /* Wyślij: [msg][hmac_sent] */
     iov[0].iov_base = msg;        iov[0].iov_len = sizeof(*msg);
     iov[1].iov_base = hmac_sent;  iov[1].iov_len = sizeof(hmac_sent);
 
@@ -343,11 +362,11 @@ static int hss_upcall(struct hss_upcall_msg *msg, struct hss_upcall_resp *resp)
     if (ret < 0)
         goto out_unlock;
 
-    /* Odbierz odpowiedź */
+    /* Odbierz: [resp][hmac_recv_stored] */
     {
         struct kvec riov[2] = {
-            { .iov_base = &tmp,              .iov_len = sizeof(tmp) },
-            { .iov_base = hmac_recv_stored,  .iov_len = sizeof(hmac_recv_stored) }
+            { .iov_base = &tmp,              .iov_len = sizeof(tmp)              },
+            { .iov_base = hmac_recv_stored,  .iov_len = sizeof(hmac_recv_stored) },
         };
         ret = kernel_recvmsg(hss_sock, &mh, riov, 2,
                              sizeof(tmp) + sizeof(hmac_recv_stored), 0);
@@ -400,7 +419,8 @@ static bool hss_inode_has_xattr(struct inode *inode, struct dentry *dentry)
 
 /* -----------------------------------------------------------------------
  * Hook LSM: inode_permission
- * Główny punkt egzekucji.
+ * Główny punkt egzekucji — wywoływany przy każdym dostępie do i-węzła.
+ * Brak plaintextu, brak deszyfrowania. Tylko relay do hss-daemon.
  * ----------------------------------------------------------------------- */
 static int holo_inode_permission(struct inode *inode, int mask)
 {
@@ -411,16 +431,13 @@ static int holo_inode_permission(struct inode *inode, int mask)
     u32 op  = 0;
     int ret;
 
-    /* Obsługujemy tylko read/write */
     if (!(mask & (MAY_READ | MAY_WRITE)))
         return 0;
 
-    /* Potrzebujemy dentry do odczytu xattr */
     dentry = d_find_alias(inode);
     if (!dentry)
         return 0;
 
-    /* Tylko pliki z xattr security.hss.lock */
     if (!hss_inode_has_xattr(inode, dentry)) {
         dput(dentry);
         return 0;
@@ -430,7 +447,7 @@ static int holo_inode_permission(struct inode *inode, int mask)
     if (mask & MAY_READ)  op |= HSS_OP_READ;
     if (mask & MAY_WRITE) op |= HSS_OP_WRITE;
 
-    /* 1. Cache */
+    /* 1. Cache — hot path */
     if (hss_cache_lookup(pid, inode->i_ino, op) == 0)
         return 0;
 
@@ -441,49 +458,44 @@ static int holo_inode_permission(struct inode *inode, int mask)
     /* 3. Upcall */
     msg.timestamp_ns = ktime_get_mono_fast_ns();
     msg.pid          = pid;
-    msg.inode_nr     = inode->i_ino;
+    msg.inode_nr     = (u64)inode->i_ino;
     msg.op_mask      = op;
     get_random_bytes(msg.nonce, sizeof(msg.nonce));
 
     ret = hss_upcall(&msg, &resp);
-    if (ret == -ENOTCONN || ret == -EAGAIN || ret == -ETIMEDOUT) {
-        if (op & HSS_OP_WRITE)
-            return -EACCES;
-        return -EAGAIN;
-    }
+    if (ret == -ENOTCONN || ret == -EAGAIN || ret == -ETIMEDOUT)
+        return (op & HSS_OP_WRITE) ? -EACCES : -EAGAIN;
     if (ret < 0)
         return -EACCES;
 
-    /* 4. Unieważnij cache jeśli demon tego zażądał */
+    /* 4. TOCTOU fix — unieważnij cache jeśli demon zażądał */
     if (resp.flags & HSS_FLAG_INVALIDATE_CACHE)
         hss_cache_invalidate(pid, inode->i_ino);
 
-    /* 5. Zapisz zezwolenie w cache (tylko jeśli decyzja == 0) */
+    /* 5. Zapisz zezwolenie w cache */
     hss_cache_store(pid, inode->i_ino, op, resp.decision);
 
-    /* 6. Zwróć decyzję zgodnie z konwencją LSM: 0 = zezwól, -EACCES = odmów */
-    if (resp.decision == 0)
-        return 0;
-    else
-        return -EACCES;
+    /* 6. Decyzja */
+    return (resp.decision == 0) ? 0 : -EACCES;
 }
 
 /* -----------------------------------------------------------------------
  * Netlink handler — komunikacja zwrotna demon → jądro
+ * Format wiadomości: [cmd u32][pid u32][inode_nr u64]
  * ----------------------------------------------------------------------- */
 static struct sock *hss_nl_sock = NULL;
 
 static void hss_netlink_rcv(struct sk_buff *skb)
 {
     struct nlmsghdr *nlh = nlmsg_hdr(skb);
-    u32 *data = NLMSG_DATA(nlh);
+    u32 *data;
     u32 pid;
     u64 inode_nr;
 
-    /* Format: [cmd u32][pid u32][inode_nr u64] */
     if (nlh->nlmsg_len < NLMSG_HDRLEN + 2 * sizeof(u32) + sizeof(u64))
         return;
 
+    data = NLMSG_DATA(nlh);
     if (data[0] == HSS_NL_CMD_INVALIDATE) {
         pid = data[1];
         memcpy(&inode_nr, &data[2], sizeof(u64));
@@ -512,11 +524,11 @@ static void hss_netlink_exit(void)
 }
 
 /* -----------------------------------------------------------------------
- * Deklaracja hooków LSM
+ * Deklaracja hooków LSM — przed holo_lsm_init() (wymagane przez C)
+ * file_open pominięty — VFS i tak woła inode_permission
  * ----------------------------------------------------------------------- */
 static struct security_hook_list holo_hooks[] __lsm_ro_after_init = {
     LSM_HOOK_INIT(inode_permission, holo_inode_permission),
-    /* file_open nie jest potrzebny – VFS i tak woła inode_permission */
 };
 
 /* -----------------------------------------------------------------------
@@ -526,16 +538,11 @@ static int __init holo_lsm_init(void)
 {
     int ret;
 
-    /*
-     * UWAGA: Aby moduł działał poprawnie, musi zostać **wbudowany w jądro**.
-     * Nie można go załadować przez insmod ze względu na __init funkcji
-     * rejestracji hooków LSM (security_add_hooks jest __init).
-     */
-
     /* 1. Pobierz klucz HMAC z keyringu */
     ret = hss_get_hmac_key();
     if (ret) {
-        pr_err("holo_lsm: nie można pobrać klucza HMAC (dodaj 'hss_upcall_key' przez keyctl)\n");
+        pr_err("holo_lsm: brak klucza HMAC — dodaj '%s' przez keyctl\n",
+               HSS_KEYRING_NAME);
         return ret;
     }
 
@@ -545,18 +552,23 @@ static int __init holo_lsm_init(void)
         return PTR_ERR(hss_hmac_tfm);
     }
 
-    ret = crypto_shash_setkey(hss_hmac_tfm, hss_hmac_key, sizeof(hss_hmac_key));
-    /* Wymaż klucz z BSS niezależnie od wyniku setkey */
+    ret = crypto_shash_setkey(hss_hmac_tfm, hss_hmac_key,
+                              sizeof(hss_hmac_key));
+    /*
+     * Wymaż klucz z BSS natychmiast po przekazaniu do crypto API.
+     * Klucz jest teraz bezpiecznie przechowywany wewnątrz tfm.
+     */
     memzero_explicit(hss_hmac_key, sizeof(hss_hmac_key));
     if (ret) {
         crypto_free_shash(hss_hmac_tfm);
         return ret;
     }
 
-    /* 2. Połącz z gniazdem demona */
+    /* 2. Połącz z gniazdem hss-daemon */
     ret = hss_connect_socket();
     if (ret) {
-        pr_err("holo_lsm: nie można połączyć z /run/hss-daemon.sock (ret=%d)\n", ret);
+        pr_err("holo_lsm: nie można połączyć z %s (ret=%d)\n",
+               HSS_DAEMON_SOCK, ret);
         crypto_free_shash(hss_hmac_tfm);
         return ret;
     }
@@ -576,7 +588,8 @@ static int __init holo_lsm_init(void)
     /* 5. Zarejestruj hooki LSM */
     security_add_hooks(holo_hooks, ARRAY_SIZE(holo_hooks), "holo");
 
-    pr_info("HolonOS HSS LSM v3 zainicjowany (upcall filter, brak plaintextu w jądrze)\n");
+    pr_info("HolonOS HSS LSM v3 zainicjowany "
+            "(upcall filter, brak plaintextu w jądrze)\n");
     return 0;
 }
 
@@ -590,10 +603,8 @@ static void __exit holo_lsm_exit(void)
     struct hlist_node *tmp;
     int bkt;
 
-    /* Zatrzymaj timer */
     del_timer_sync(&hss_rate_cleanup_timer);
 
-    /* Zwolnij cache */
     spin_lock(&hss_cache_lock);
     hash_for_each_safe(hss_cache_table, bkt, tmp, ce, node) {
         hash_del_rcu(&ce->node);
@@ -602,7 +613,6 @@ static void __exit holo_lsm_exit(void)
     spin_unlock(&hss_cache_lock);
     synchronize_rcu();
 
-    /* Zwolnij rate limiter */
     spin_lock(&hss_rate_lock);
     hash_for_each_safe(hss_rate_table, bkt, tmp, re, node) {
         hash_del(&re->node);
@@ -610,15 +620,12 @@ static void __exit holo_lsm_exit(void)
     }
     spin_unlock(&hss_rate_lock);
 
-    /* Zwolnij HMAC */
     if (hss_hmac_tfm)
         crypto_free_shash(hss_hmac_tfm);
 
-    /* Zamknij gniazdo */
     if (hss_sock)
         sock_release(hss_sock);
 
-    /* Zwolnij Netlink */
     hss_netlink_exit();
 
     pr_info("HolonOS HSS LSM zatrzymany\n");
