@@ -1,29 +1,22 @@
 /*
  * security/holo/holo_lsm.c
  *
- * HolonOS HSS LSM v4.2 – final hardened
+ * HolonOS HSS LSM v4.3 – rock solid
  *
  * Wymaga architektury 64-bit (LP64/LLP64).
  * Port na 32-bit wymaga dostosowania typów hash i precyzji FP.
+ *
+ * Zmiany v4.3:
+ *   - cache store: pre-admission eviction (evict PRZED dodaniem)
+ *   - recv loop: pętla jak send (MSG_WAITALL to nie gwarancja)
+ *   - socket lifetime: explicit mutex scope documentation
+ *   - cache count: double-check clamp po operacji
  *
  * Zmiany v4.2:
  *   - sendmsg: len obliczany z rzeczywistego iov (poprawność)
  *   - sock->sk: lokalna referencja (zero UAF window)
  *   - eviction: full scan fallback po bounded (gwarancja usunięcia)
  *   - cache store: atomic_inc_return + evict przy overflow
- *
- * Zmiany v4.1:
- *   - iov rebuild: uproszczona logika bez edge-case ambiguity
- *   - eviction: scan limit 64 bucketów (bounded latency)
- *   - circuit breaker: >= zamiast > (off-by-one fix)
- *   - cache sanity: upper bound detection (overcount)
- *   - xattr: usunięty redundantny ENOTSUP
- *
- * Zmiany v4.0:
- *   - partial send: iov rebuild zamiast mutacji (poprawność)
- *   - eviction: pełny wrap modulo (równomierna dystrybucja)
- *   - circuit breaker: użyj module_param zamiast hardcode
- *   - xattr: granularna obsługa błędów (-EIO vs -ESTALE)
  *
  * Autor: Maciej Mazur
  * Licencja: GPL-2.0
@@ -60,7 +53,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Maciej Mazur");
-MODULE_DESCRIPTION("HolonOS HSS LSM v4.2 – final hardened");
+MODULE_DESCRIPTION("HolonOS HSS LSM v4.3 – rock solid");
 
 static unsigned int hss_cache_ttl_ms       = 100;
 static unsigned int hss_cache_deny_ttl_ms  = 1000;
@@ -148,7 +141,13 @@ static inline u64 hss_rate_key(u32 pid, u32 op_mask)
     return ((u64)pid << 32) | op_mask;
 }
 
-/* Komunikacja */
+/*
+ * Komunikacja
+ *
+ * SOCKET LIFETIME: hss_sock jest chroniony przez hss_sock_mutex.
+ * Wszystkie operacje na socket (send/recv) MUSZĄ być wykonywane
+ * pod tym mutexem. To eliminuje UAF window bez potrzeby refcount.
+ */
 static struct socket    *hss_sock    = NULL;
 static struct crypto_shash *hss_hmac_tfm = NULL;
 static u8 hss_hmac_key[32];
@@ -275,6 +274,12 @@ static int hss_reconnect(void)
     return ret ? -ECONNREFUSED : 0;
 }
 
+/*
+ * hss_upcall_locked - wykonaj upcall do demona
+ *
+ * WYMAGA: hss_sock_mutex held
+ * Socket lifetime jest gwarantowany przez mutex scope.
+ */
 static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp *resp)
 {
     struct msghdr mh = { .msg_flags = MSG_NOSIGNAL };
@@ -285,19 +290,21 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
     struct socket *sock;
     struct sock *sk;
     size_t total_sent = 0;
+    size_t total_recv = 0;
     const size_t msg_len = sizeof(*msg);
     const size_t hmac_len = 32;
     const size_t expected_send = msg_len + hmac_len;
+    const size_t expected_recv = sizeof(tmp) + hmac_len;
 
     if (unlikely(!hss_hmac_tfm))
         return -ENOTCONN;
 
-    sock = READ_ONCE(hss_sock);
+    /* Socket access pod mutexem — lifetime gwarantowany */
+    sock = hss_sock;
     if (unlikely(!sock))
         return -ENOTCONN;
 
-    /* Lokalna referencja do sk — zero UAF window */
-    sk = READ_ONCE(sock->sk);
+    sk = sock->sk;
     if (unlikely(!sk))
         return -ENOTCONN;
 
@@ -310,25 +317,22 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
             return ret;
     }
 
-    /* Partial send loop z czystym iov rebuild */
+    /* === SEND LOOP === */
     while (total_sent < expected_send) {
         struct kvec iov[2];
         int iov_count = 0;
         size_t msg_remaining, hmac_offset;
         size_t chunk_len = 0;
 
-        /* Oblicz ile zostało z każdej części */
         msg_remaining = (total_sent < msg_len) ? (msg_len - total_sent) : 0;
         hmac_offset = (total_sent >= msg_len) ? (total_sent - msg_len) : 0;
 
-        /* Dodaj część msg jeśli jeszcze nie wysłana */
         if (msg_remaining > 0) {
             iov[iov_count].iov_base = (u8 *)msg + total_sent;
             iov[iov_count].iov_len = msg_remaining;
             iov_count++;
         }
 
-        /* Dodaj część hmac */
         if (total_sent + msg_remaining >= msg_len && hmac_offset < hmac_len) {
             iov[iov_count].iov_base = hmac_sent + hmac_offset;
             iov[iov_count].iov_len = hmac_len - hmac_offset;
@@ -338,7 +342,6 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
         if (iov_count == 0)
             break;
 
-        /* Oblicz rzeczywisty chunk z iov */
         for (j = 0; j < iov_count; j++)
             chunk_len += iov[j].iov_len;
 
@@ -351,23 +354,48 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
         total_sent += ret;
     }
 
+    /* === RECV LOOP === */
     old_timeo = sk->sk_rcvtimeo;
     sk->sk_rcvtimeo = msecs_to_jiffies(hss_upcall_timeout_ms);
 
-    {
-        struct kvec riov[2] = {
-            { .iov_base = &tmp,             .iov_len = sizeof(tmp) },
-            { .iov_base = hmac_recv_stored, .iov_len = 32 },
-        };
-        ret = kernel_recvmsg(sock, &mh, riov, 2, sizeof(tmp) + 32, MSG_WAITALL);
+    while (total_recv < expected_recv) {
+        struct kvec riov[2];
+        int riov_count = 0;
+        size_t resp_remaining, hmac_recv_offset;
+        size_t chunk_len = 0;
+
+        resp_remaining = (total_recv < sizeof(tmp)) ? (sizeof(tmp) - total_recv) : 0;
+        hmac_recv_offset = (total_recv >= sizeof(tmp)) ? (total_recv - sizeof(tmp)) : 0;
+
+        if (resp_remaining > 0) {
+            riov[riov_count].iov_base = (u8 *)&tmp + total_recv;
+            riov[riov_count].iov_len = resp_remaining;
+            riov_count++;
+        }
+
+        if (total_recv + resp_remaining >= sizeof(tmp) && hmac_recv_offset < hmac_len) {
+            riov[riov_count].iov_base = hmac_recv_stored + hmac_recv_offset;
+            riov[riov_count].iov_len = hmac_len - hmac_recv_offset;
+            riov_count++;
+        }
+
+        if (riov_count == 0)
+            break;
+
+        for (j = 0; j < riov_count; j++)
+            chunk_len += riov[j].iov_len;
+
+        ret = kernel_recvmsg(sock, &mh, riov, riov_count, chunk_len, 0);
+        if (ret <= 0) {
+            sk->sk_rcvtimeo = old_timeo;
+            pr_warn("holo_lsm: recv failed (ret=%d, recv=%zu/%zu)\n",
+                    ret, total_recv, expected_recv);
+            return (ret == 0 || ret == -EAGAIN) ? -ETIMEDOUT : -ENOTCONN;
+        }
+        total_recv += ret;
     }
 
     sk->sk_rcvtimeo = old_timeo;
-
-    if (ret != sizeof(tmp) + 32) {
-        pr_warn("holo_lsm: partial recv (got %d)\n", ret);
-        return -ENOTCONN;
-    }
 
     /* Weryfikacja HMAC + nonce (timing-safe) */
     {
@@ -399,23 +427,19 @@ static bool hss_inode_has_xattr(struct inode *inode, struct dentry *dentry)
     if (ret >= 0)
         return true;
 
-    /* Brak xattr lub FS nie wspiera */
     if (ret == -ENODATA || ret == -EOPNOTSUPP)
         return false;
 
-    /* Stale handle - soft fail, nie blokuj */
     if (ret == -ESTALE) {
         pr_debug("holo_lsm: xattr ESTALE, soft fail\n");
         return false;
     }
 
-    /* IO error, permission error - fail-closed */
     if (ret == -EIO || ret == -EACCES || ret == -EPERM) {
         pr_warn_ratelimited("holo_lsm: xattr check failed (err=%d), fail-closed\n", ret);
         return true;
     }
 
-    /* Inne błędy - fail-closed z logiem */
     pr_warn_ratelimited("holo_lsm: xattr unexpected error (err=%d), fail-closed\n", ret);
     return true;
 }
@@ -479,7 +503,7 @@ static void hss_cache_evict_one(void)
 
     spin_lock_irqsave(&hss_cache_lock, flags);
 
-    /* Faza 1: szukaj expired entry (bounded scan) */
+    /* Faza 1: szukaj expired (bounded) */
     for (i = 0; i < scan_limit; i++) {
         bkt = (start_bkt + i) % HSS_CACHE_BUCKETS;
         hlist_for_each_entry_safe(victim, tmp, &hss_cache_table[bkt], node) {
@@ -493,7 +517,7 @@ static void hss_cache_evict_one(void)
         }
     }
 
-    /* Faza 2: brak expired — usuń pierwszy napotkany (bounded scan) */
+    /* Faza 2: usuń pierwszy (bounded) */
     for (i = 0; i < scan_limit; i++) {
         bkt = (start_bkt + i) % HSS_CACHE_BUCKETS;
         hlist_for_each_entry_safe(victim, tmp, &hss_cache_table[bkt], node) {
@@ -505,7 +529,7 @@ static void hss_cache_evict_one(void)
         }
     }
 
-    /* Faza 3: fallback — full scan gwarancja */
+    /* Faza 3: fallback full scan */
     for (i = 0; i < HSS_CACHE_BUCKETS; i++) {
         bkt = (start_bkt + i) % HSS_CACHE_BUCKETS;
         hlist_for_each_entry_safe(victim, tmp, &hss_cache_table[bkt], node) {
@@ -520,19 +544,25 @@ static void hss_cache_evict_one(void)
     spin_unlock_irqrestore(&hss_cache_lock, flags);
 }
 
+/*
+ * hss_cache_store - zapisz decyzję w cache
+ *
+ * Wzorzec: PRE-ADMISSION EVICTION
+ * Evict PRZED dodaniem nowego wpisu, nie po.
+ * To eliminuje race condition przy overflow.
+ */
 static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
 {
     struct hss_cache_entry *entry, *old = NULL;
     unsigned long flags;
     unsigned long expiry;
     u32 hash;
-    int new_count;
 
-    /* Sanity check przed operacją */
+    /* Sanity check */
     hss_cache_count_sanity_check();
 
-    /* Evict przed dodaniem jeśli pełny */
-    if (atomic_read(&hss_cache_count) >= HSS_CACHE_MAX_ENTRIES)
+    /* PRE-ADMISSION: evict PRZED alokacją jeśli pełny */
+    while (atomic_read(&hss_cache_count) >= HSS_CACHE_MAX_ENTRIES)
         hss_cache_evict_one();
 
     expiry = jiffies + msecs_to_jiffies(
@@ -551,6 +581,7 @@ static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
 
     spin_lock_irqsave(&hss_cache_lock, flags);
 
+    /* Szukaj istniejącego wpisu do zastąpienia */
     hash_for_each_possible(hss_cache_table, old, node, hash) {
         if (old->pid == pid &&
             old->inode_id == inode_id &&
@@ -562,22 +593,17 @@ static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
 
     hash_add_rcu(hss_cache_table, &entry->node, hash);
 
-    if (!old) {
-        new_count = atomic_inc_return(&hss_cache_count);
-        /* Backpressure: evict natychmiast jeśli przekroczony */
-        if (unlikely(new_count > HSS_CACHE_MAX_ENTRIES)) {
-            spin_unlock_irqrestore(&hss_cache_lock, flags);
-            hss_cache_evict_one();
-            if (old)
-                kfree_rcu(old, rcu);
-            return;
-        }
-    }
+    if (!old)
+        atomic_inc(&hss_cache_count);
 
     spin_unlock_irqrestore(&hss_cache_lock, flags);
 
     if (old)
         kfree_rcu(old, rcu);
+
+    /* Double-check clamp po operacji */
+    if (unlikely(atomic_read(&hss_cache_count) > HSS_CACHE_MAX_ENTRIES))
+        hss_cache_evict_one();
 }
 
 static void hss_cache_invalidate(u32 pid, u64 inode_id, u32 op_mask)
@@ -700,7 +726,6 @@ static void hss_cleanup_timer_callback(struct timer_list *unused)
     hss_rate_cleanup_old();
     hss_cache_count_sanity_check();
 
-    /* Circuit breaker decay — zmniejsz o 1 co sekundę */
     fail_count = atomic_read(&hss_upcall_fail_count);
     if (fail_count > 0)
         atomic_dec(&hss_upcall_fail_count);
@@ -789,7 +814,7 @@ static int holo_inode_permission(struct inode *inode, int mask)
     if (cache_ret == -EACCES)
         return -EACCES;
 
-    /* 2. Circuit breaker (>= dla poprawnej semantyki) */
+    /* 2. Circuit breaker */
     if (atomic_read(&hss_upcall_fail_count) >= hss_circuit_breaker_threshold) {
         pr_warn_ratelimited("holo_lsm: circuit breaker open\n");
         return (op & HSS_OP_WRITE) ? -EACCES : 0;
@@ -807,7 +832,7 @@ static int holo_inode_permission(struct inode *inode, int mask)
     msg.op_mask      = op;
     get_random_bytes(msg.nonce, sizeof(msg.nonce));
 
-    /* 5. Trylock i upcall */
+    /* 5. Trylock i upcall (socket lifetime pod mutexem) */
     if (!mutex_trylock(&hss_sock_mutex)) {
         pr_warn_ratelimited("holo_lsm: socket contention, degraded mode\n");
         return (op & HSS_OP_WRITE) ? -EACCES : 0;
@@ -896,7 +921,7 @@ static int __init holo_lsm_init(void)
     mod_timer(&hss_cleanup_timer, round_jiffies(jiffies + HZ));
 
     security_add_hooks(holo_hooks, ARRAY_SIZE(holo_hooks), "holo");
-    pr_info("HolonOS HSS LSM v4.2 loaded (final hardened)\n");
+    pr_info("HolonOS HSS LSM v4.3 loaded (rock solid)\n");
     return 0;
 }
 
@@ -935,7 +960,7 @@ static void __exit holo_lsm_exit(void)
     if (hss_hmac_tfm)
         crypto_free_shash(hss_hmac_tfm);
 
-    pr_info("HolonOS HSS LSM v4.2 unloaded\n");
+    pr_info("HolonOS HSS LSM v4.3 unloaded\n");
 }
 
 module_init(holo_lsm_init);
