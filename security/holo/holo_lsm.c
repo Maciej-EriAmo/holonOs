@@ -1,10 +1,17 @@
 /*
  * security/holo/holo_lsm.c
  *
- * HolonOS HSS LSM v3.8 – stable hardened
+ * HolonOS HSS LSM v3.9 – final stable
  *
  * Wymaga architektury 64-bit (LP64/LLP64).
  * Port na 32-bit wymaga dostosowania typów hash i precyzji FP.
+ *
+ * Zmiany v3.9:
+ *   - partial send loop (fix reconnect storm)
+ *   - eviction fallback (gwarantowane zwolnienie miejsca)
+ *   - cache count sanity check (drift protection)
+ *   - timeout default 15ms (redukcja false positives)
+ *   - xattr fail-closed z logowaniem
  *
  * Zmiany v3.8:
  *   - xattr fail-closed (IO error → deny)
@@ -60,11 +67,11 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Maciej Mazur");
-MODULE_DESCRIPTION("HolonOS HSS LSM v3.8 – stable hardened");
+MODULE_DESCRIPTION("HolonOS HSS LSM v3.9 – final stable");
 
 static unsigned int hss_cache_ttl_ms       = 100;
 static unsigned int hss_cache_deny_ttl_ms  = 1000;
-static unsigned int hss_upcall_timeout_ms  = 5;
+static unsigned int hss_upcall_timeout_ms  = 15;  /* tuned: 15ms default */
 static unsigned int hss_rate_limit_per_sec = 100;
 static unsigned int hss_reconnect_max_attempts = 3;
 static unsigned int hss_reconnect_delay_us     = 50000;
@@ -178,6 +185,7 @@ static void hss_rate_cleanup_old(void);
 static void hss_cleanup_timer_callback(struct timer_list *unused);
 static int hss_netlink_init(void);
 static void hss_netlink_exit(void);
+static void hss_cache_count_sanity_check(void);
 
 /* === Implementacja ======================================================== */
 
@@ -281,6 +289,8 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
     int ret;
     long old_timeo;
     struct socket *sock = READ_ONCE(hss_sock);
+    size_t total_sent = 0;
+    size_t expected_send = sizeof(*msg) + 32;
 
     if (!hss_hmac_tfm || !sock || !READ_ONCE(sock->sk))
         return -ENOTCONN;
@@ -297,10 +307,29 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
     iov[0].iov_base = msg;        iov[0].iov_len = sizeof(*msg);
     iov[1].iov_base = hmac_sent;  iov[1].iov_len = 32;
 
-    ret = kernel_sendmsg(sock, &mh, iov, 2, sizeof(*msg) + 32);
-    if (ret != sizeof(*msg) + 32) {
-        pr_warn("holo_lsm: partial send\n");
-        return -ENOTCONN;
+    /* Partial send loop */
+    while (total_sent < expected_send) {
+        ret = kernel_sendmsg(sock, &mh, iov, 2, expected_send - total_sent);
+        if (ret <= 0) {
+            pr_warn("holo_lsm: send failed (ret=%d, sent=%zu/%zu)\n",
+                    ret, total_sent, expected_send);
+            return -ENOTCONN;
+        }
+        total_sent += ret;
+
+        /* Adjust iov for next iteration if needed */
+        if (total_sent < expected_send) {
+            size_t skip = ret;
+            if (skip >= iov[0].iov_len) {
+                skip -= iov[0].iov_len;
+                iov[0].iov_len = 0;
+                iov[1].iov_base = (u8 *)iov[1].iov_base + skip;
+                iov[1].iov_len -= skip;
+            } else {
+                iov[0].iov_base = (u8 *)iov[0].iov_base + skip;
+                iov[0].iov_len -= skip;
+            }
+        }
     }
 
     old_timeo = sock->sk->sk_rcvtimeo;
@@ -353,8 +382,19 @@ static bool hss_inode_has_xattr(struct inode *inode, struct dentry *dentry)
     if (ret == -ENODATA || ret == -EOPNOTSUPP)
         return false;
 
-    /* IO error, permission error, etc. → fail-closed */
+    /* IO error, permission error, etc. → fail-closed z logowaniem */
+    pr_warn_ratelimited("holo_lsm: xattr check failed (err=%d), fail-closed\n", ret);
     return true;
+}
+
+/* === Cache count sanity =================================================== */
+static void hss_cache_count_sanity_check(void)
+{
+    int count = atomic_read(&hss_cache_count);
+    if (count < 0) {
+        pr_warn("holo_lsm: cache count drift detected (%d), resetting\n", count);
+        atomic_set(&hss_cache_count, 0);
+    }
 }
 
 /* === Cache (ALLOW/DENY) ================================================== */
@@ -367,11 +407,11 @@ static int hss_cache_lookup(u32 pid, u64 inode_id, u32 op_mask)
     rcu_read_lock();
     hash_for_each_possible_rcu(hss_cache_table, entry, node,
                                hss_cache_hash(pid, inode_id, op_mask)) {
-        if (entry->pid == pid &&
-            entry->inode_id == inode_id &&
-            entry->op_mask == op_mask) {
-            if (time_before(now, entry->expiry_jiffies))
-                decision = entry->decision;
+        if (READ_ONCE(entry->pid) == pid &&
+            READ_ONCE(entry->inode_id) == inode_id &&
+            READ_ONCE(entry->op_mask) == op_mask) {
+            if (time_before(now, READ_ONCE(entry->expiry_jiffies)))
+                decision = READ_ONCE(entry->decision);
             else
                 decision = -ESTALE;
             break;
@@ -401,8 +441,8 @@ static void hss_cache_evict_one(void)
 
     spin_lock_irqsave(&hss_cache_lock, flags);
 
-    /* Najpierw szukaj expired w docelowym ubiecie */
-    hash_for_each_possible_safe(hss_cache_table, victim, tmp, node, target_bkt) {
+    /* Najpierw szukaj expired w dowolnym ubiecie od target */
+    hash_for_each_safe(hss_cache_table, bkt, tmp, victim, node) {
         if (time_after_eq(now, victim->expiry_jiffies)) {
             hash_del_rcu(&victim->node);
             atomic_dec(&hss_cache_count);
@@ -418,9 +458,18 @@ static void hss_cache_evict_one(void)
         if (bkt >= target_bkt) {
             hash_del_rcu(&victim->node);
             atomic_dec(&hss_cache_count);
-            break;
+            spin_unlock_irqrestore(&hss_cache_lock, flags);
+            kfree_rcu(victim, rcu);
+            return;
         }
-        victim = NULL;
+    }
+
+    /* Fallback: usuń pierwszy napotkany (gdy target_bkt > wszystkie) */
+    victim = NULL;
+    hash_for_each_safe(hss_cache_table, bkt, tmp, victim, node) {
+        hash_del_rcu(&victim->node);
+        atomic_dec(&hss_cache_count);
+        break;
     }
 
     spin_unlock_irqrestore(&hss_cache_lock, flags);
@@ -435,6 +484,9 @@ static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
     unsigned long flags;
     unsigned long expiry;
     u32 hash;
+
+    /* Sanity check przed operacją */
+    hss_cache_count_sanity_check();
 
     /* Evict zamiast drop przy pełnym cache */
     if (atomic_read(&hss_cache_count) >= HSS_CACHE_MAX_ENTRIES)
@@ -592,6 +644,7 @@ static void hss_cleanup_timer_callback(struct timer_list *unused)
 
     hss_cache_flush_old_entries();
     hss_rate_cleanup_old();
+    hss_cache_count_sanity_check();
 
     /* Circuit breaker decay — zmniejsz o 1 co sekundę */
     fail_count = atomic_read(&hss_upcall_fail_count);
@@ -790,7 +843,7 @@ static int __init holo_lsm_init(void)
     mod_timer(&hss_cleanup_timer, round_jiffies(jiffies + HZ));
 
     security_add_hooks(holo_hooks, ARRAY_SIZE(holo_hooks), "holo");
-    pr_info("HolonOS HSS LSM v3.8 loaded (stable hardened)\n");
+    pr_info("HolonOS HSS LSM v3.9 loaded (final stable)\n");
     return 0;
 }
 
@@ -829,7 +882,7 @@ static void __exit holo_lsm_exit(void)
     if (hss_hmac_tfm)
         crypto_free_shash(hss_hmac_tfm);
 
-    pr_info("HolonOS HSS LSM v3.8 unloaded\n");
+    pr_info("HolonOS HSS LSM v3.9 unloaded\n");
 }
 
 module_init(holo_lsm_init);
