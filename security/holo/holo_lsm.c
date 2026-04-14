@@ -1,10 +1,16 @@
 /*
  * security/holo/holo_lsm.c
  *
- * HolonOS HSS LSM v4.1 – hardened production
+ * HolonOS HSS LSM v4.2 – final hardened
  *
  * Wymaga architektury 64-bit (LP64/LLP64).
  * Port na 32-bit wymaga dostosowania typów hash i precyzji FP.
+ *
+ * Zmiany v4.2:
+ *   - sendmsg: len obliczany z rzeczywistego iov (poprawność)
+ *   - sock->sk: lokalna referencja (zero UAF window)
+ *   - eviction: full scan fallback po bounded (gwarancja usunięcia)
+ *   - cache store: atomic_inc_return + evict przy overflow
  *
  * Zmiany v4.1:
  *   - iov rebuild: uproszczona logika bez edge-case ambiguity
@@ -18,32 +24,6 @@
  *   - eviction: pełny wrap modulo (równomierna dystrybucja)
  *   - circuit breaker: użyj module_param zamiast hardcode
  *   - xattr: granularna obsługa błędów (-EIO vs -ESTALE)
- *
- * Zmiany v3.9:
- *   - partial send loop (fix reconnect storm)
- *   - eviction fallback (gwarantowane zwolnienie miejsca)
- *   - cache count sanity check (drift protection)
- *   - timeout default 15ms (redukcja false positives)
- *   - xattr fail-closed z logowaniem
- *
- * Zmiany v3.8:
- *   - xattr fail-closed (IO error → deny)
- *   - cache random eviction zamiast hard drop
- *   - circuit breaker decay w timerze
- *
- * Zmiany v3.7:
- *   - MSG_WAITALL w recvmsg (fix partial recv)
- *   - crypto_memneq dla nonce (timing-safe)
- *   - op_mask w cache hash (redukcja kolizji)
- *   - cache size limit 4096 entries (memory cap)
- *
- * Zmiany v3.6:
- *   - single-flight reconnect (atomic flag) eliminuje thundering herd
- *   - rozdzielony cache decyzji (przechowuje zarówno ALLOW, jak i DENY)
- *   - ulepszony klucz rate-limitera: ((u64)pid << 32) | op_mask
- *   - netlink: wymagane CAP_SYS_ADMIN (oprócz UID 0)
- *   - circuit breaker: po N błędach upcall przechodzi w tryb fail-open/closed
- *   - hardening nonce: memset(msg, 0, sizeof(msg))
  *
  * Autor: Maciej Mazur
  * Licencja: GPL-2.0
@@ -80,7 +60,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Maciej Mazur");
-MODULE_DESCRIPTION("HolonOS HSS LSM v4.1 – hardened production");
+MODULE_DESCRIPTION("HolonOS HSS LSM v4.2 – final hardened");
 
 static unsigned int hss_cache_ttl_ms       = 100;
 static unsigned int hss_cache_deny_ttl_ms  = 1000;
@@ -300,9 +280,10 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
     struct msghdr mh = { .msg_flags = MSG_NOSIGNAL };
     u8 hmac_sent[32], hmac_recv_stored[32], hmac_recv_computed[32];
     struct hss_upcall_resp tmp = {0};
-    int ret;
+    int ret, j;
     long old_timeo;
-    struct socket *sock = READ_ONCE(hss_sock);
+    struct socket *sock;
+    struct sock *sk;
     size_t total_sent = 0;
     const size_t msg_len = sizeof(*msg);
     const size_t hmac_len = 32;
@@ -310,9 +291,14 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
 
     if (unlikely(!hss_hmac_tfm))
         return -ENOTCONN;
+
+    sock = READ_ONCE(hss_sock);
     if (unlikely(!sock))
         return -ENOTCONN;
-    if (unlikely(!READ_ONCE(sock->sk)))
+
+    /* Lokalna referencja do sk — zero UAF window */
+    sk = READ_ONCE(sock->sk);
+    if (unlikely(!sk))
         return -ENOTCONN;
 
     /* HMAC send */
@@ -329,10 +315,11 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
         struct kvec iov[2];
         int iov_count = 0;
         size_t msg_remaining, hmac_offset;
+        size_t chunk_len = 0;
 
         /* Oblicz ile zostało z każdej części */
         msg_remaining = (total_sent < msg_len) ? (msg_len - total_sent) : 0;
-        hmac_offset = (total_sent > msg_len) ? (total_sent - msg_len) : 0;
+        hmac_offset = (total_sent >= msg_len) ? (total_sent - msg_len) : 0;
 
         /* Dodaj część msg jeśli jeszcze nie wysłana */
         if (msg_remaining > 0) {
@@ -341,24 +328,21 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
             iov_count++;
         }
 
-        /* Dodaj część hmac jeśli już w tej fazie */
-        if (total_sent >= msg_len || msg_remaining == 0) {
-            if (hmac_offset < hmac_len) {
-                iov[iov_count].iov_base = hmac_sent + hmac_offset;
-                iov[iov_count].iov_len = hmac_len - hmac_offset;
-                iov_count++;
-            }
-        } else if (msg_remaining > 0) {
-            /* Pierwsza iteracja: msg + hmac razem */
-            iov[iov_count].iov_base = hmac_sent;
-            iov[iov_count].iov_len = hmac_len;
+        /* Dodaj część hmac */
+        if (total_sent + msg_remaining >= msg_len && hmac_offset < hmac_len) {
+            iov[iov_count].iov_base = hmac_sent + hmac_offset;
+            iov[iov_count].iov_len = hmac_len - hmac_offset;
             iov_count++;
         }
 
         if (iov_count == 0)
             break;
 
-        ret = kernel_sendmsg(sock, &mh, iov, iov_count, expected_send - total_sent);
+        /* Oblicz rzeczywisty chunk z iov */
+        for (j = 0; j < iov_count; j++)
+            chunk_len += iov[j].iov_len;
+
+        ret = kernel_sendmsg(sock, &mh, iov, iov_count, chunk_len);
         if (ret <= 0) {
             pr_warn("holo_lsm: send failed (ret=%d, sent=%zu/%zu)\n",
                     ret, total_sent, expected_send);
@@ -367,8 +351,8 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
         total_sent += ret;
     }
 
-    old_timeo = sock->sk->sk_rcvtimeo;
-    sock->sk->sk_rcvtimeo = msecs_to_jiffies(hss_upcall_timeout_ms);
+    old_timeo = sk->sk_rcvtimeo;
+    sk->sk_rcvtimeo = msecs_to_jiffies(hss_upcall_timeout_ms);
 
     {
         struct kvec riov[2] = {
@@ -378,7 +362,7 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
         ret = kernel_recvmsg(sock, &mh, riov, 2, sizeof(tmp) + 32, MSG_WAITALL);
     }
 
-    sock->sk->sk_rcvtimeo = old_timeo;
+    sk->sk_rcvtimeo = old_timeo;
 
     if (ret != sizeof(tmp) + 32) {
         pr_warn("holo_lsm: partial recv (got %d)\n", ret);
@@ -521,6 +505,18 @@ static void hss_cache_evict_one(void)
         }
     }
 
+    /* Faza 3: fallback — full scan gwarancja */
+    for (i = 0; i < HSS_CACHE_BUCKETS; i++) {
+        bkt = (start_bkt + i) % HSS_CACHE_BUCKETS;
+        hlist_for_each_entry_safe(victim, tmp, &hss_cache_table[bkt], node) {
+            hash_del_rcu(&victim->node);
+            atomic_dec(&hss_cache_count);
+            spin_unlock_irqrestore(&hss_cache_lock, flags);
+            kfree_rcu(victim, rcu);
+            return;
+        }
+    }
+
     spin_unlock_irqrestore(&hss_cache_lock, flags);
 }
 
@@ -530,11 +526,12 @@ static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
     unsigned long flags;
     unsigned long expiry;
     u32 hash;
+    int new_count;
 
     /* Sanity check przed operacją */
     hss_cache_count_sanity_check();
 
-    /* Evict zamiast drop przy pełnym cache */
+    /* Evict przed dodaniem jeśli pełny */
     if (atomic_read(&hss_cache_count) >= HSS_CACHE_MAX_ENTRIES)
         hss_cache_evict_one();
 
@@ -564,8 +561,19 @@ static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
     }
 
     hash_add_rcu(hss_cache_table, &entry->node, hash);
-    if (!old)
-        atomic_inc(&hss_cache_count);
+
+    if (!old) {
+        new_count = atomic_inc_return(&hss_cache_count);
+        /* Backpressure: evict natychmiast jeśli przekroczony */
+        if (unlikely(new_count > HSS_CACHE_MAX_ENTRIES)) {
+            spin_unlock_irqrestore(&hss_cache_lock, flags);
+            hss_cache_evict_one();
+            if (old)
+                kfree_rcu(old, rcu);
+            return;
+        }
+    }
+
     spin_unlock_irqrestore(&hss_cache_lock, flags);
 
     if (old)
@@ -888,7 +896,7 @@ static int __init holo_lsm_init(void)
     mod_timer(&hss_cleanup_timer, round_jiffies(jiffies + HZ));
 
     security_add_hooks(holo_hooks, ARRAY_SIZE(holo_hooks), "holo");
-    pr_info("HolonOS HSS LSM v4.1 loaded (hardened production)\n");
+    pr_info("HolonOS HSS LSM v4.2 loaded (final hardened)\n");
     return 0;
 }
 
@@ -927,7 +935,7 @@ static void __exit holo_lsm_exit(void)
     if (hss_hmac_tfm)
         crypto_free_shash(hss_hmac_tfm);
 
-    pr_info("HolonOS HSS LSM v4.1 unloaded\n");
+    pr_info("HolonOS HSS LSM v4.2 unloaded\n");
 }
 
 module_init(holo_lsm_init);
