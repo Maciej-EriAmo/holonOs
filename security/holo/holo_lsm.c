@@ -1,22 +1,22 @@
 /*
  * security/holo/holo_lsm.c
  *
- * HolonOS HSS LSM v4.3 – rock solid
+ * HolonOS HSS LSM v4.4 – enterprise hardened
  *
  * Wymaga architektury 64-bit (LP64/LLP64).
  * Port na 32-bit wymaga dostosowania typów hash i precyzji FP.
  *
- * Zmiany v4.3:
- *   - cache store: pre-admission eviction (evict PRZED dodaniem)
- *   - recv loop: pętla jak send (MSG_WAITALL to nie gwarancja)
- *   - socket lifetime: explicit mutex scope documentation
- *   - cache count: double-check clamp po operacji
+ * Zmiany v4.4:
+ *   - mutex nesting fix: rozdzielone _locked() variants
+ *   - sk_rcvtimeo: lock_sock/release_sock dla thread-safety
+ *   - trylock: -EAGAIN zamiast ALLOW (eliminacja policy bypass)
+ *   - cache: atomic_inc_return pattern przywrócony
  *
- * Zmiany v4.2:
- *   - sendmsg: len obliczany z rzeczywistego iov (poprawność)
- *   - sock->sk: lokalna referencja (zero UAF window)
- *   - eviction: full scan fallback po bounded (gwarancja usunięcia)
- *   - cache store: atomic_inc_return + evict przy overflow
+ * Zmiany v4.3:
+ *   - cache store: pre-admission eviction
+ *   - recv loop: pętla jak send
+ *   - socket lifetime: explicit mutex scope
+ *   - cache count: double-check clamp
  *
  * Autor: Maciej Mazur
  * Licencja: GPL-2.0
@@ -53,7 +53,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Maciej Mazur");
-MODULE_DESCRIPTION("HolonOS HSS LSM v4.3 – rock solid");
+MODULE_DESCRIPTION("HolonOS HSS LSM v4.4 – enterprise hardened");
 
 static unsigned int hss_cache_ttl_ms       = 100;
 static unsigned int hss_cache_deny_ttl_ms  = 1000;
@@ -144,9 +144,12 @@ static inline u64 hss_rate_key(u32 pid, u32 op_mask)
 /*
  * Komunikacja
  *
- * SOCKET LIFETIME: hss_sock jest chroniony przez hss_sock_mutex.
- * Wszystkie operacje na socket (send/recv) MUSZĄ być wykonywane
- * pod tym mutexem. To eliminuje UAF window bez potrzeby refcount.
+ * LOCKING HIERARCHY:
+ *   hss_sock_mutex → protects hss_sock pointer and socket operations
+ *   lock_sock(sk)  → protects socket internals (sk_rcvtimeo)
+ *
+ * INVARIANT: All socket I/O happens under hss_sock_mutex.
+ *            Socket option changes use lock_sock/release_sock.
  */
 static struct socket    *hss_sock    = NULL;
 static struct crypto_shash *hss_hmac_tfm = NULL;
@@ -165,6 +168,7 @@ static struct sock *hss_nl_sock = NULL;
 
 /* === Deklaracje =========================================================== */
 static int hss_get_hmac_key(void);
+static int hss_connect_socket_locked(void);
 static int hss_connect_socket(void);
 static int hss_reconnect(void);
 static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp *resp);
@@ -207,14 +211,17 @@ out:
     return ret;
 }
 
-static int hss_connect_socket(void)
+/*
+ * hss_connect_socket_locked - connect to daemon socket
+ *
+ * REQUIRES: hss_sock_mutex held
+ */
+static int hss_connect_socket_locked(void)
 {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     int ret, i;
 
     strncpy(addr.sun_path, HSS_DAEMON_SOCK, sizeof(addr.sun_path) - 1);
-
-    mutex_lock(&hss_sock_mutex);
 
     if (hss_sock) {
         sock_release(hss_sock);
@@ -223,7 +230,7 @@ static int hss_connect_socket(void)
 
     ret = sock_create_kern(&init_net, AF_UNIX, SOCK_STREAM, 0, &hss_sock);
     if (ret)
-        goto out;
+        return ret;
 
     for (i = 0; i < 5; i++) {
         ret = kernel_connect(hss_sock, (struct sockaddr *)&addr, sizeof(addr), 0);
@@ -238,26 +245,42 @@ static int hss_connect_socket(void)
         hss_sock = NULL;
     }
 
-out:
-    mutex_unlock(&hss_sock_mutex);
     return ret;
 }
 
+/*
+ * hss_connect_socket - wrapper with locking
+ */
+static int hss_connect_socket(void)
+{
+    int ret;
+
+    mutex_lock(&hss_sock_mutex);
+    ret = hss_connect_socket_locked();
+    mutex_unlock(&hss_sock_mutex);
+
+    return ret;
+}
+
+/*
+ * hss_reconnect - reconnect with single-flight and retry
+ *
+ * Uses atomic flag to prevent thundering herd.
+ * Locking is flat (no nested mutex_lock).
+ */
 static int hss_reconnect(void)
 {
     int ret = -ECONNREFUSED;
     int attempts = 0;
 
+    /* Single-flight: only one thread reconnects */
     if (atomic_cmpxchg(&hss_reconnecting, 0, 1) != 0)
         return -EALREADY;
 
     mutex_lock(&hss_sock_mutex);
 
     while (attempts < hss_reconnect_max_attempts) {
-        mutex_unlock(&hss_sock_mutex);
-        ret = hss_connect_socket();
-        mutex_lock(&hss_sock_mutex);
-
+        ret = hss_connect_socket_locked();
         if (ret == 0)
             break;
 
@@ -275,10 +298,12 @@ static int hss_reconnect(void)
 }
 
 /*
- * hss_upcall_locked - wykonaj upcall do demona
+ * hss_upcall_locked - execute upcall to daemon
  *
- * WYMAGA: hss_sock_mutex held
- * Socket lifetime jest gwarantowany przez mutex scope.
+ * REQUIRES: hss_sock_mutex held
+ *
+ * Uses lock_sock/release_sock for sk_rcvtimeo manipulation
+ * to ensure thread-safety with network stack.
  */
 static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp *resp)
 {
@@ -299,7 +324,6 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
     if (unlikely(!hss_hmac_tfm))
         return -ENOTCONN;
 
-    /* Socket access pod mutexem — lifetime gwarantowany */
     sock = hss_sock;
     if (unlikely(!sock))
         return -ENOTCONN;
@@ -308,7 +332,7 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
     if (unlikely(!sk))
         return -ENOTCONN;
 
-    /* HMAC send */
+    /* HMAC compute */
     {
         SHASH_DESC_ON_STACK(shash, hss_hmac_tfm);
         shash->tfm = hss_hmac_tfm;
@@ -354,10 +378,13 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
         total_sent += ret;
     }
 
-    /* === RECV LOOP === */
+    /* === RECV SETUP with lock_sock === */
+    lock_sock(sk);
     old_timeo = sk->sk_rcvtimeo;
     sk->sk_rcvtimeo = msecs_to_jiffies(hss_upcall_timeout_ms);
+    release_sock(sk);
 
+    /* === RECV LOOP === */
     while (total_recv < expected_recv) {
         struct kvec riov[2];
         int riov_count = 0;
@@ -387,7 +414,9 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
 
         ret = kernel_recvmsg(sock, &mh, riov, riov_count, chunk_len, 0);
         if (ret <= 0) {
+            lock_sock(sk);
             sk->sk_rcvtimeo = old_timeo;
+            release_sock(sk);
             pr_warn("holo_lsm: recv failed (ret=%d, recv=%zu/%zu)\n",
                     ret, total_recv, expected_recv);
             return (ret == 0 || ret == -EAGAIN) ? -ETIMEDOUT : -ENOTCONN;
@@ -395,7 +424,10 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
         total_recv += ret;
     }
 
+    /* Restore timeout */
+    lock_sock(sk);
     sk->sk_rcvtimeo = old_timeo;
+    release_sock(sk);
 
     /* Weryfikacja HMAC + nonce (timing-safe) */
     {
@@ -463,6 +495,7 @@ static int hss_cache_lookup(u32 pid, u64 inode_id, u32 op_mask)
 {
     struct hss_cache_entry *entry;
     unsigned long now = jiffies;
+    unsigned long expiry;
     int decision = -ENOENT;
 
     rcu_read_lock();
@@ -471,7 +504,9 @@ static int hss_cache_lookup(u32 pid, u64 inode_id, u32 op_mask)
         if (READ_ONCE(entry->pid) == pid &&
             READ_ONCE(entry->inode_id) == inode_id &&
             READ_ONCE(entry->op_mask) == op_mask) {
-            if (time_before(now, READ_ONCE(entry->expiry_jiffies)))
+            expiry = READ_ONCE(entry->expiry_jiffies);
+            smp_rmb(); /* Ensure expiry read before decision */
+            if (time_before(now, expiry))
                 decision = READ_ONCE(entry->decision);
             else
                 decision = -ESTALE;
@@ -545,11 +580,9 @@ static void hss_cache_evict_one(void)
 }
 
 /*
- * hss_cache_store - zapisz decyzję w cache
+ * hss_cache_store - store decision in cache
  *
- * Wzorzec: PRE-ADMISSION EVICTION
- * Evict PRZED dodaniem nowego wpisu, nie po.
- * To eliminuje race condition przy overflow.
+ * Pattern: atomic_inc_return for race-free overflow detection
  */
 static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
 {
@@ -557,12 +590,12 @@ static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
     unsigned long flags;
     unsigned long expiry;
     u32 hash;
+    int new_count;
 
-    /* Sanity check */
     hss_cache_count_sanity_check();
 
-    /* PRE-ADMISSION: evict PRZED alokacją jeśli pełny */
-    while (atomic_read(&hss_cache_count) >= HSS_CACHE_MAX_ENTRIES)
+    /* Pre-check: evict if near limit */
+    if (atomic_read(&hss_cache_count) >= HSS_CACHE_MAX_ENTRIES - 1)
         hss_cache_evict_one();
 
     expiry = jiffies + msecs_to_jiffies(
@@ -581,7 +614,6 @@ static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
 
     spin_lock_irqsave(&hss_cache_lock, flags);
 
-    /* Szukaj istniejącego wpisu do zastąpienia */
     hash_for_each_possible(hss_cache_table, old, node, hash) {
         if (old->pid == pid &&
             old->inode_id == inode_id &&
@@ -593,17 +625,21 @@ static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
 
     hash_add_rcu(hss_cache_table, &entry->node, hash);
 
-    if (!old)
-        atomic_inc(&hss_cache_count);
+    if (!old) {
+        new_count = atomic_inc_return(&hss_cache_count);
+        if (unlikely(new_count > HSS_CACHE_MAX_ENTRIES)) {
+            spin_unlock_irqrestore(&hss_cache_lock, flags);
+            hss_cache_evict_one();
+            if (old)
+                kfree_rcu(old, rcu);
+            return;
+        }
+    }
 
     spin_unlock_irqrestore(&hss_cache_lock, flags);
 
     if (old)
         kfree_rcu(old, rcu);
-
-    /* Double-check clamp po operacji */
-    if (unlikely(atomic_read(&hss_cache_count) > HSS_CACHE_MAX_ENTRIES))
-        hss_cache_evict_one();
 }
 
 static void hss_cache_invalidate(u32 pid, u64 inode_id, u32 op_mask)
@@ -832,10 +868,16 @@ static int holo_inode_permission(struct inode *inode, int mask)
     msg.op_mask      = op;
     get_random_bytes(msg.nonce, sizeof(msg.nonce));
 
-    /* 5. Trylock i upcall (socket lifetime pod mutexem) */
+    /*
+     * 5. Socket access with trylock
+     *
+     * POLICY: On contention, return -EAGAIN (retry).
+     * This prevents policy bypass via load-induced contention.
+     * Applications should retry on EAGAIN.
+     */
     if (!mutex_trylock(&hss_sock_mutex)) {
-        pr_warn_ratelimited("holo_lsm: socket contention, degraded mode\n");
-        return (op & HSS_OP_WRITE) ? -EACCES : 0;
+        pr_debug("holo_lsm: socket contention\n");
+        return -EAGAIN;
     }
 
     ret = hss_upcall_locked(&msg, &resp);
@@ -851,12 +893,12 @@ static int holo_inode_permission(struct inode *inode, int mask)
     if (ret == -ENOTCONN) {
         int rc = hss_reconnect();
         if (rc == 0 || rc == -EALREADY)
-            return (op & HSS_OP_WRITE) ? -EACCES : 0;
-        return (op & HSS_OP_WRITE) ? -EACCES : -EAGAIN;
+            return -EAGAIN; /* Retry after reconnect */
+        return -EAGAIN;
     }
 
     if (ret == -ETIMEDOUT)
-        return (op & HSS_OP_WRITE) ? -EACCES : -EAGAIN;
+        return -EAGAIN;
 
     if (ret < 0)
         return -EACCES;
@@ -921,7 +963,7 @@ static int __init holo_lsm_init(void)
     mod_timer(&hss_cleanup_timer, round_jiffies(jiffies + HZ));
 
     security_add_hooks(holo_hooks, ARRAY_SIZE(holo_hooks), "holo");
-    pr_info("HolonOS HSS LSM v4.3 loaded (rock solid)\n");
+    pr_info("HolonOS HSS LSM v4.4 loaded (enterprise hardened)\n");
     return 0;
 }
 
@@ -960,7 +1002,7 @@ static void __exit holo_lsm_exit(void)
     if (hss_hmac_tfm)
         crypto_free_shash(hss_hmac_tfm);
 
-    pr_info("HolonOS HSS LSM v4.3 unloaded\n");
+    pr_info("HolonOS HSS LSM v4.4 unloaded\n");
 }
 
 module_init(holo_lsm_init);
