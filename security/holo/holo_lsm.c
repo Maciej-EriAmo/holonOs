@@ -3,6 +3,9 @@
  *
  * HolonOS HSS LSM v3.6 – audytowana wersja produkcyjna
  *
+ * Wymaga architektury 64-bit (LP64/LLP64).
+ * Port na 32-bit wymaga dostosowania typów hash i precyzji FP.
+ *
  * Nowości v3.6:
  *   - single-flight reconnect (atomic flag) eliminuje thundering herd
  *   - rozdzielony cache decyzji (przechowuje zarówno ALLOW, jak i DENY)
