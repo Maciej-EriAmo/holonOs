@@ -1,12 +1,18 @@
 /*
  * security/holo/holo_lsm.c
  *
- * HolonOS HSS LSM v3.6 – audytowana wersja produkcyjna
+ * HolonOS HSS LSM v3.7 – stable hardened
  *
  * Wymaga architektury 64-bit (LP64/LLP64).
  * Port na 32-bit wymaga dostosowania typów hash i precyzji FP.
  *
- * Nowości v3.6:
+ * Zmiany v3.7:
+ *   - MSG_WAITALL w recvmsg (fix partial recv)
+ *   - crypto_memneq dla nonce (timing-safe)
+ *   - op_mask w cache hash (redukcja kolizji)
+ *   - cache size limit 4096 entries (memory cap)
+ *
+ * Zmiany v3.6:
  *   - single-flight reconnect (atomic flag) eliminuje thundering herd
  *   - rozdzielony cache decyzji (przechowuje zarówno ALLOW, jak i DENY)
  *   - ulepszony klucz rate-limitera: ((u64)pid << 32) | op_mask
@@ -49,10 +55,10 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Maciej Mazur");
-MODULE_DESCRIPTION("HolonOS HSS LSM v3.6 – production safe upcall filter");
+MODULE_DESCRIPTION("HolonOS HSS LSM v3.7 – stable hardened");
 
 static unsigned int hss_cache_ttl_ms       = 100;
-static unsigned int hss_cache_deny_ttl_ms  = 1000;  /* dłuższy TTL dla odmów */
+static unsigned int hss_cache_deny_ttl_ms  = 1000;
 static unsigned int hss_upcall_timeout_ms  = 5;
 static unsigned int hss_rate_limit_per_sec = 100;
 static unsigned int hss_reconnect_max_attempts = 3;
@@ -74,6 +80,7 @@ module_param(hss_circuit_breaker_threshold, uint, 0644);
 #define HSS_XATTR_NAME            "security.hss.lock"
 #define HSS_DAEMON_SOCK           "/run/hss-daemon.sock"
 #define HSS_KEYRING_NAME          "hss_upcall_key"
+#define HSS_CACHE_MAX_ENTRIES     4096
 
 #define NETLINK_HSS 30
 enum { HSS_NL_CMD_INVALIDATE = 1, };
@@ -89,16 +96,16 @@ struct hss_upcall_msg {
 
 struct hss_upcall_resp {
     u8  nonce_echo[16];
-    u32 decision;   /* 0 = allow, 1 = deny */
+    u32 decision;
     u32 flags;
 } __packed;
 
-/* Cache – przechowuje zarówno ALLOW, jak i DENY */
+/* Cache */
 struct hss_cache_entry {
     u32           pid;
     u64           inode_id;
     u32           op_mask;
-    u32           decision;       /* 0 = allow, 1 = deny */
+    u32           decision;
     unsigned long expiry_jiffies;
     struct hlist_node node;
     struct rcu_head   rcu;
@@ -107,17 +114,18 @@ struct hss_cache_entry {
 #define HSS_CACHE_BITS 8
 static DEFINE_HASHTABLE(hss_cache_table, HSS_CACHE_BITS);
 static DEFINE_SPINLOCK(hss_cache_lock);
+static atomic_t hss_cache_count = ATOMIC_INIT(0);
 
-static inline u32 hss_cache_hash(u32 pid, u64 inode_id)
+static inline u32 hss_cache_hash(u32 pid, u64 inode_id, u32 op_mask)
 {
-    u64 key = ((u64)pid << 32) ^ inode_id;
+    u64 key = ((u64)pid << 32) ^ inode_id ^ op_mask;
     return hash_long(key, HSS_CACHE_BITS);
 }
 
 /* Rate limiter */
 struct hss_rate_entry {
     u32           pid;
-    u32           op_mask;        /* dodane do klucza */
+    u32           op_mask;
     atomic_t      count;
     unsigned long window_start;
     struct hlist_node node;
@@ -138,7 +146,7 @@ static struct socket    *hss_sock    = NULL;
 static struct crypto_shash *hss_hmac_tfm = NULL;
 static u8 hss_hmac_key[32];
 static DEFINE_MUTEX(hss_sock_mutex);
-static atomic_t hss_reconnecting = ATOMIC_INIT(0);   /* single-flight */
+static atomic_t hss_reconnecting = ATOMIC_INIT(0);
 
 /* Circuit breaker */
 static atomic_t hss_upcall_fail_count = ATOMIC_INIT(0);
@@ -146,7 +154,7 @@ static atomic_t hss_upcall_fail_count = ATOMIC_INIT(0);
 /* Timer czyszczący */
 static struct timer_list hss_cleanup_timer;
 
-/* Netlink (host-only) */
+/* Netlink */
 static struct sock *hss_nl_sock = NULL;
 
 /* === Deklaracje =========================================================== */
@@ -157,7 +165,7 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
 static bool hss_inode_has_xattr(struct inode *inode, struct dentry *dentry);
 static int hss_cache_lookup(u32 pid, u64 inode_id, u32 op_mask);
 static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision);
-static void hss_cache_invalidate(u32 pid, u64 inode_id);
+static void hss_cache_invalidate(u32 pid, u64 inode_id, u32 op_mask);
 static void hss_cache_flush_old_entries(void);
 static bool hss_rate_check(u32 pid, u32 op_mask);
 static void hss_rate_cleanup_old(void);
@@ -227,15 +235,13 @@ out:
     return ret;
 }
 
-/* Reconnect z single-flight */
 static int hss_reconnect(void)
 {
     int ret = -ECONNREFUSED;
     int attempts = 0;
 
-    /* Tylko jeden wątek wykonuje faktyczny reconnect */
     if (atomic_cmpxchg(&hss_reconnecting, 0, 1) != 0)
-        return -EALREADY;   /* sygnał, że reconnect już trwa */
+        return -EALREADY;
 
     mutex_lock(&hss_sock_mutex);
 
@@ -260,7 +266,6 @@ static int hss_reconnect(void)
     return ret ? -ECONNREFUSED : 0;
 }
 
-/* Upcall – zakłada, że mutex trzymany */
 static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp *resp)
 {
     struct msghdr mh = { .msg_flags = MSG_NOSIGNAL };
@@ -271,7 +276,7 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
     long old_timeo;
     struct socket *sock = READ_ONCE(hss_sock);
 
-    if (!hss_hmac_tfm || !sock || !sock->sk)
+    if (!hss_hmac_tfm || !sock || !READ_ONCE(sock->sk))
         return -ENOTCONN;
 
     /* HMAC send */
@@ -289,7 +294,7 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
     ret = kernel_sendmsg(sock, &mh, iov, 2, sizeof(*msg) + 32);
     if (ret != sizeof(*msg) + 32) {
         pr_warn("holo_lsm: partial send\n");
-        return -ENOTCONN;   /* reconnect przy następnym wywołaniu */
+        return -ENOTCONN;
     }
 
     old_timeo = sock->sk->sk_rcvtimeo;
@@ -300,7 +305,7 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
             { .iov_base = &tmp,             .iov_len = sizeof(tmp) },
             { .iov_base = hmac_recv_stored, .iov_len = 32 },
         };
-        ret = kernel_recvmsg(sock, &mh, riov, 2, sizeof(tmp) + 32, 0);
+        ret = kernel_recvmsg(sock, &mh, riov, 2, sizeof(tmp) + 32, MSG_WAITALL);
     }
 
     sock->sk->sk_rcvtimeo = old_timeo;
@@ -310,7 +315,7 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
         return -ENOTCONN;
     }
 
-    /* Weryfikacja HMAC + nonce */
+    /* Weryfikacja HMAC + nonce (timing-safe) */
     {
         SHASH_DESC_ON_STACK(shash, hss_hmac_tfm);
         shash->tfm = hss_hmac_tfm;
@@ -320,7 +325,7 @@ static int hss_upcall_locked(struct hss_upcall_msg *msg, struct hss_upcall_resp 
     }
 
     if (crypto_memneq(hmac_recv_stored, hmac_recv_computed, 32) ||
-        memcmp(msg->nonce, tmp.nonce_echo, 16) != 0)
+        crypto_memneq(msg->nonce, tmp.nonce_echo, 16))
         return -EBADMSG;
 
     *resp = tmp;
@@ -340,16 +345,16 @@ static int hss_cache_lookup(u32 pid, u64 inode_id, u32 op_mask)
 {
     struct hss_cache_entry *entry;
     unsigned long now = jiffies;
-    int decision = -ENOENT;   /* brak wpisu */
+    int decision = -ENOENT;
 
     rcu_read_lock();
     hash_for_each_possible_rcu(hss_cache_table, entry, node,
-                               hss_cache_hash(pid, inode_id)) {
+                               hss_cache_hash(pid, inode_id, op_mask)) {
         if (entry->pid == pid &&
             entry->inode_id == inode_id &&
             entry->op_mask == op_mask) {
             if (time_before(now, entry->expiry_jiffies))
-                decision = entry->decision;   /* 0 = allow, 1 = deny */
+                decision = entry->decision;
             else
                 decision = -ESTALE;
             break;
@@ -362,16 +367,23 @@ static int hss_cache_lookup(u32 pid, u64 inode_id, u32 op_mask)
     else if (decision == 1)
         return -EACCES;
     else
-        return -ENOENT;   /* cache miss */
+        return -ENOENT;
 }
 
 static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
 {
     struct hss_cache_entry *entry, *old = NULL;
     unsigned long flags;
-    unsigned long expiry = jiffies + msecs_to_jiffies(
+    unsigned long expiry;
+    u32 hash;
+
+    /* Hard cap na rozmiar cache */
+    if (atomic_read(&hss_cache_count) >= HSS_CACHE_MAX_ENTRIES)
+        return;
+
+    expiry = jiffies + msecs_to_jiffies(
         (decision == 0) ? hss_cache_ttl_ms : hss_cache_deny_ttl_ms);
-    u32 hash = hss_cache_hash(pid, inode_id);
+    hash = hss_cache_hash(pid, inode_id, op_mask);
 
     entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
     if (!entry)
@@ -395,31 +407,39 @@ static void hss_cache_store(u32 pid, u64 inode_id, u32 op_mask, u32 decision)
     }
 
     hash_add_rcu(hss_cache_table, &entry->node, hash);
+    if (!old)
+        atomic_inc(&hss_cache_count);
     spin_unlock_irqrestore(&hss_cache_lock, flags);
 
     if (old)
         kfree_rcu(old, rcu);
 }
 
-static void hss_cache_invalidate(u32 pid, u64 inode_id)
+static void hss_cache_invalidate(u32 pid, u64 inode_id, u32 op_mask)
 {
     struct hss_cache_entry *entry;
     struct hlist_node *tmp;
     unsigned long flags;
     HLIST_HEAD(garbage);
-    int bkt;
+    u32 hash = hss_cache_hash(pid, inode_id, op_mask);
+    int removed = 0;
 
     spin_lock_irqsave(&hss_cache_lock, flags);
-    hash_for_each_safe(hss_cache_table, bkt, tmp, entry, node) {
-        if (entry->pid == pid && entry->inode_id == inode_id) {
+    hash_for_each_possible_safe(hss_cache_table, entry, tmp, node, hash) {
+        if (entry->pid == pid &&
+            entry->inode_id == inode_id &&
+            entry->op_mask == op_mask) {
             hash_del_rcu(&entry->node);
             hlist_add_head(&entry->node, &garbage);
+            removed++;
         }
     }
     spin_unlock_irqrestore(&hss_cache_lock, flags);
 
-    hlist_for_each_entry_safe(entry, tmp, &garbage, node)
+    hlist_for_each_entry_safe(entry, tmp, &garbage, node) {
         kfree_rcu(entry, rcu);
+        atomic_dec(&hss_cache_count);
+    }
 }
 
 static void hss_cache_flush_old_entries(void)
@@ -430,21 +450,25 @@ static void hss_cache_flush_old_entries(void)
     unsigned long now = jiffies;
     HLIST_HEAD(garbage);
     int bkt;
+    int removed = 0;
 
     spin_lock_irqsave(&hss_cache_lock, flags);
     hash_for_each_safe(hss_cache_table, bkt, tmp, entry, node) {
         if (time_after_eq(now, entry->expiry_jiffies)) {
             hash_del_rcu(&entry->node);
             hlist_add_head(&entry->node, &garbage);
+            removed++;
         }
     }
     spin_unlock_irqrestore(&hss_cache_lock, flags);
 
-    hlist_for_each_entry_safe(entry, tmp, &garbage, node)
+    hlist_for_each_entry_safe(entry, tmp, &garbage, node) {
         kfree_rcu(entry, rcu);
+        atomic_dec(&hss_cache_count);
+    }
 }
 
-/* === Rate limiter (ulepszony klucz) ======================================= */
+/* === Rate limiter ========================================================= */
 static bool hss_rate_check(u32 pid, u32 op_mask)
 {
     struct hss_rate_entry *entry;
@@ -514,10 +538,11 @@ static void hss_cleanup_timer_callback(struct timer_list *unused)
     mod_timer(&hss_cleanup_timer, round_jiffies(jiffies + HZ));
 }
 
-/* === Netlink (wzmocniona autoryzacja) ===================================== */
+/* === Netlink ============================================================== */
 struct hss_nl_invalidate_msg {
     u32 pid;
     u64 inode_id;
+    u32 op_mask;
 };
 
 static void hss_nl_recv_msg(struct sk_buff *skb)
@@ -531,12 +556,11 @@ static void hss_nl_recv_msg(struct sk_buff *skb)
     if (nlh->nlmsg_len < NLMSG_HDRLEN + sizeof(*msg))
         return;
 
-    /* Wymagamy CAP_SYS_ADMIN (oprócz UID 0) */
     if (!netlink_capable(skb, CAP_SYS_ADMIN))
         return;
 
     msg = nlmsg_data(nlh);
-    hss_cache_invalidate(msg->pid, msg->inode_id);
+    hss_cache_invalidate(msg->pid, msg->inode_id, msg->op_mask);
 }
 
 static int __init hss_netlink_init(void)
@@ -559,7 +583,7 @@ static void hss_netlink_exit(void)
         netlink_kernel_release(hss_nl_sock);
 }
 
-/* === Główny hook LSM (z circuit breaker) ================================== */
+/* === Główny hook LSM ====================================================== */
 static int holo_inode_permission(struct inode *inode, int mask)
 {
     struct hss_upcall_msg  msg;
@@ -569,7 +593,7 @@ static int holo_inode_permission(struct inode *inode, int mask)
     u64 inode_id;
     u32 op  = 0;
     int ret, cache_ret;
-    static const int max_fail = 100;   /* próg circuit breaker */
+    static const int max_fail = 100;
 
     if (!(mask & (MAY_READ | MAY_WRITE)))
         return 0;
@@ -589,16 +613,16 @@ static int holo_inode_permission(struct inode *inode, int mask)
 
     inode_id = ((u64)inode->i_sb->s_dev << 32) | inode->i_ino;
 
-    /* 1. Sprawdź cache (ALLOW/DENY) */
+    /* 1. Sprawdź cache */
     cache_ret = hss_cache_lookup(pid, inode_id, op);
     if (cache_ret == 0)
         return 0;
     if (cache_ret == -EACCES)
-        return -EACCES;   /* cache DENY */
+        return -EACCES;
 
-    /* 2. Circuit breaker – jeśli zbyt wiele błędów, fail-open/closed */
+    /* 2. Circuit breaker */
     if (atomic_read(&hss_upcall_fail_count) > max_fail) {
-        pr_warn_ratelimited("holo_lsm: circuit breaker open – upcall failing\n");
+        pr_warn_ratelimited("holo_lsm: circuit breaker open\n");
         return (op & HSS_OP_WRITE) ? -EACCES : 0;
     }
 
@@ -606,7 +630,7 @@ static int holo_inode_permission(struct inode *inode, int mask)
     if (!hss_rate_check(pid, op))
         return -EAGAIN;
 
-    /* 4. Przygotuj wiadomość (hardening nonce) */
+    /* 4. Przygotuj wiadomość */
     memset(&msg, 0, sizeof(msg));
     msg.timestamp_ns = ktime_get_mono_fast_ns();
     msg.pid          = pid;
@@ -616,26 +640,24 @@ static int holo_inode_permission(struct inode *inode, int mask)
 
     /* 5. Trylock i upcall */
     if (!mutex_trylock(&hss_sock_mutex)) {
+        pr_warn_ratelimited("holo_lsm: socket contention, degraded mode\n");
         return (op & HSS_OP_WRITE) ? -EACCES : 0;
     }
 
     ret = hss_upcall_locked(&msg, &resp);
     mutex_unlock(&hss_sock_mutex);
 
-    /* 6. Aktualizuj circuit breaker */
-    if (ret < 0 && ret != -EBADMSG) {
+    /* 6. Circuit breaker update */
+    if (ret < 0 && ret != -EBADMSG)
         atomic_inc(&hss_upcall_fail_count);
-    } else {
+    else
         atomic_set(&hss_upcall_fail_count, 0);
-    }
 
-    /* 7. Reconnect (single-flight) */
+    /* 7. Reconnect */
     if (ret == -ENOTCONN) {
         int rc = hss_reconnect();
-        if (rc == 0 || rc == -EALREADY) {
-            /* Reconnect w toku – użyj polityki degradacji */
+        if (rc == 0 || rc == -EALREADY)
             return (op & HSS_OP_WRITE) ? -EACCES : 0;
-        }
         return (op & HSS_OP_WRITE) ? -EACCES : -EAGAIN;
     }
 
@@ -650,7 +672,7 @@ static int holo_inode_permission(struct inode *inode, int mask)
         return -EACCES;
 
     if (resp.flags & HSS_FLAG_INVALIDATE_CACHE)
-        hss_cache_invalidate(pid, inode_id);
+        hss_cache_invalidate(pid, inode_id, op);
 
     /* 9. Zapisz w cache */
     hss_cache_store(pid, inode_id, op, resp.decision);
@@ -705,7 +727,7 @@ static int __init holo_lsm_init(void)
     mod_timer(&hss_cleanup_timer, round_jiffies(jiffies + HZ));
 
     security_add_hooks(holo_hooks, ARRAY_SIZE(holo_hooks), "holo");
-    pr_info("HolonOS HSS LSM v3.6 loaded (production: circuit breaker + single-flight)\n");
+    pr_info("HolonOS HSS LSM v3.7 loaded (stable hardened)\n");
     return 0;
 }
 
@@ -744,7 +766,7 @@ static void __exit holo_lsm_exit(void)
     if (hss_hmac_tfm)
         crypto_free_shash(hss_hmac_tfm);
 
-    pr_info("HolonOS HSS LSM unloaded\n");
+    pr_info("HolonOS HSS LSM v3.7 unloaded\n");
 }
 
 module_init(holo_lsm_init);
