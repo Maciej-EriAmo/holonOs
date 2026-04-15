@@ -1,38 +1,3 @@
-# HolonOS HSS LSM v3.4
-
-> `security/holo/holo_lsm.c`  
-> Autor: **Maciej Mazur** — Independent AI Researcher, Warsaw, Poland  
-> GitHub: `Maciej-EriAmo/HolonOS` | Licencja: GPL-2.0
-
----
-
-## Architektura
-
-| Warstwa | Rola |
-|---------|------|
-| **Kernel** | Czysty transport. Zero semantyki HSS w jądrze. |
-| **Daemon** | Weryfikacja algebrą (Ring-LWE, KDF, HMAC). |
-| **Φ** | Korzeń `s_sess` z którego wyprowadzone są `s_A` i capability tokeny. |
-
-**Pytanie kernela:** _„agent o tej tożsamości w tej sesji Φ chce dostępu do tego pryzmatu"_  
-**Pytanie daemona:** _„czy `HMAC(s_A, prism_id)` zgadza się z `capability_hint`?"_
-
----
-
-## Zmiany v3.4 względem v3.3
-
-- `hss_upcall_msg` rozszerzony o `phi_session_id` i `capability_hint` — kernel przekazuje je nieprzejrzyście do daemona; daemon weryfikuje: `HMAC(s_A, prism_id) == capability_hint`
-- `phi_session_id` i `capability_hint` ładowane z kernel keyring per-PID (agent rejestruje kontekst przez `keyctl` przy starcie)
-- `s_dev` włączone do `inode_id` dla globalnej unikalności (jak w v4.4)
-- `netlink_capable(CAP_SYS_ADMIN)` dla bezpieczeństwa Netlink
-- `synchronize_rcu()` w exit po zwolnieniu cache
-- `hss_connect_socket_locked()` / `hss_connect_socket()` rozdzielone
-
----
-
-## Kod źródłowy
-
-```c
 /*
  * security/holo/holo_lsm.c
  *
